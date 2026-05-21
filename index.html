@@ -3,11 +3,79 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My Google AI Studio App</title>
+    <title>ChemConnect Studio</title>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Load STACK JS injected script manually to avoid bundler issues
+      window.addEventListener('load', function() {
+        try {
+          // In Moodle STACK, this gets replaced with the actual URL
+          var corsUrl = '[[cors src="stackjsiframe.js"/]]';
+          // If it hasn't been replaced, we are not in STACK
+          if (corsUrl.indexOf('[[cors') > -1) {
+             console.log("Not running in a STACK environment. Normal mode active.");
+             return;
+          }
+          
+          import(corsUrl).then(function(module) {
+            var stack_js = module.stack_js || window.stack_js || module.default;
+            if (stack_js) {
+              // Note to instructor: Change 'ans1' to your actual input name if different
+              stack_js.request_access_to_input("ans1", true).then(function(inputId) {
+                var hiddenInput = document.getElementById(inputId);
+                window.__stackInput = hiddenInput;
+                
+                if (hiddenInput && hiddenInput.value) {
+                  window.dispatchEvent(new CustomEvent('stack-load-molecule', { detail: hiddenInput.value }));
+                }
+
+                window.dispatchEvent(new Event('stack-environment-detected'));
+
+                window.addEventListener('molecule-changed', function(e) {
+                  if (hiddenInput) {
+                    hiddenInput.value = JSON.stringify(e.detail);
+                    hiddenInput.dispatchEvent(new Event('change'));
+                  }
+                });
+              }).catch(function(err) {
+                console.warn("STACK integration initialization failed.", err);
+              });
+            }
+          }).catch(function(err) {
+             // Fallback to classic script tag
+             console.warn("Dynamic import failed, trying classic script:", err);
+             var script = document.createElement('script');
+             script.src = corsUrl;
+             script.onload = function() {
+               if (window.stack_js) {
+                  window.stack_js.request_access_to_input("ans1", true).then(function(inputId) {
+                    var hiddenInput = document.getElementById(inputId);
+                    window.__stackInput = hiddenInput;
+                    if (hiddenInput && hiddenInput.value) {
+                      window.dispatchEvent(new CustomEvent('stack-load-molecule', { detail: hiddenInput.value }));
+                    }
+                    window.dispatchEvent(new Event('stack-environment-detected'));
+                    window.addEventListener('molecule-changed', function(e) {
+                      if (hiddenInput) {
+                        hiddenInput.value = JSON.stringify(e.detail);
+                        hiddenInput.dispatchEvent(new Event('change'));
+                      }
+                    });
+                  }).catch(function(err) {
+                    console.warn("STACK integration initialization failed.", err);
+                  });
+               }
+             };
+             document.head.appendChild(script);
+          });
+        } catch (e) {
+          console.log("Not running in STACK environment.", e);
+        }
+      });
+    </script>
   </body>
 </html>
 

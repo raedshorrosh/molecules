@@ -1,4 +1,4 @@
-export type ElementType = 'C' | 'H' | 'O' | 'N' | 'P' | 'S' | 'F' | 'Cl' | 'Br' | 'I';
+export type ElementType = string;
 
 export interface Atom {
   id: string;
@@ -13,7 +13,7 @@ export interface Bond {
   id: string;
   atom1Id: string;
   atom2Id: string;
-  order: 1 | 2 | 3;
+  order: 0 | 1 | 2 | 3;
 }
 
 export interface Molecule {
@@ -45,4 +45,17 @@ export const ATOM_TEXT_COLORS: Record<ElementType, string> = {
   Cl: '#ffffff',
   Br: '#ffffff',
   I: '#ffffff',
+};
+
+export const ATOM_RADII: Record<ElementType, number> = {
+  H: 14,
+  C: 20,
+  N: 19,
+  O: 18,
+  F: 17,
+  P: 24,
+  S: 23,
+  Cl: 22,
+  Br: 24,
+  I: 26,
 };
