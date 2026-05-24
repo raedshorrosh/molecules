@@ -79,9 +79,9 @@ if (fs.existsSync(file)) {
     break;
   }
 
-  // 4. In case any "{@" or "{#" remain in the raw HTML body, break them apart
-  content = content.replace(/\{@/g, '{ @');
-  content = content.replace(/\{#/g, '{ #');
+  // We no longer need to break `{#` and `{@` because all JS code block contents 
+  // that might have contained them are now cleanly base64 encoded, 
+  // meaning STACK casting won't trip over random react tokens.
 
   fs.writeFileSync(file, content);
   fs.writeFileSync(path.join(process.cwd(), 'dist/molecule-editor.html'), content);

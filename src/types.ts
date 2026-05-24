@@ -13,7 +13,7 @@ export interface Bond {
   id: string;
   atom1Id: string;
   atom2Id: string;
-  order: 0 | 1 | 2 | 3;
+  order: number;
 }
 
 export interface Molecule {

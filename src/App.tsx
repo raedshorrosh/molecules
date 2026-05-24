@@ -17,7 +17,9 @@ import {
   Copy,
   Check,
   X,
-  AlertCircle
+  AlertCircle,
+  Wand2,
+  Activity
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '@/src/lib/utils.ts';
@@ -36,12 +38,63 @@ interface CompareResult {
   message: string;
 }
 
+function getConnectedComponents(atoms: Atom[], bonds: Bond[]): Molecule[] {
+  const components: Molecule[] = [];
+  const visited = new Set<string>();
+  
+  const adjList = new Map<string, string[]>();
+  atoms.forEach(a => adjList.set(a.id, []));
+  bonds.forEach(b => {
+    adjList.get(b.atom1Id)?.push(b.atom2Id);
+    adjList.get(b.atom2Id)?.push(b.atom1Id);
+  });
+  
+  for (const a of atoms) {
+    if (!visited.has(a.id)) {
+      const compAtoms: Atom[] = [];
+      const compAtomIds = new Set<string>();
+      
+      const q = [a.id];
+      visited.add(a.id);
+      
+      while (q.length > 0) {
+        const currId = q.shift()!;
+        compAtomIds.add(currId);
+        const currAt = atoms.find(at => at.id === currId);
+        if (currAt) compAtoms.push(currAt);
+        
+        for (const neighborId of adjList.get(currId) || []) {
+          if (!visited.has(neighborId)) {
+            visited.add(neighborId);
+            q.push(neighborId);
+          }
+        }
+      }
+      
+      const compBonds = bonds.filter(b => compAtomIds.has(b.atom1Id) && compAtomIds.has(b.atom2Id));
+      components.push({ atoms: compAtoms, bonds: compBonds });
+    }
+  }
+  
+  return components;
+}
+
 function areMoleculesEqual(m1: Molecule, m2: Molecule, strictMatching: boolean): CompareResult {
   const getExpectedValency = (symbol: string) => {
     const valencies: Record<string, number> = {
-      C: 4, N: 3, O: 2, H: 1, F: 1, Cl: 1, Br: 1, I: 1, P: 5, S: 6
+      C: 4, N: 3, O: 2, H: 1, F: 1, Cl: 1, Br: 1, I: 1, P: 3, S: 2
     };
     return valencies[symbol] || 0;
+  };
+
+  const getExpectedLonePairs = (symbol: string, bondingSum: number, charge: number) => {
+    const valenceElectrons: Record<string, number> = {
+      H: 1, C: 4, N: 5, O: 6, F: 7, Cl: 7, Br: 7, I: 7, P: 5, S: 6
+    };
+    const val = valenceElectrons[symbol];
+    if (val === undefined) return 0;
+    const remaining = val - bondingSum - charge;
+    return Math.max(0, Math.floor(remaining / 2));
   };
 
   const buildGraph = (m: Molecule) => {
@@ -67,7 +120,7 @@ function areMoleculesEqual(m1: Molecule, m2: Molecule, strictMatching: boolean):
     const allNodes = [...gNodes];
     if (!strictMatching) {
       for (const n of gNodes) {
-        const currentV = n.adj.reduce((sum, e) => sum + e.order, 0);
+        const currentV = n.adj.reduce((sum, e) => sum + (Number(e.order) === 4 || Number(e.order) === 5 ? 1 : Number(e.order)), 0);
         const expectedV = getExpectedValency(n.symbol);
         const implicitH = Math.max(0, expectedV - currentV);
         for (let i = 0; i < implicitH; i++) {
@@ -163,13 +216,27 @@ function areMoleculesEqual(m1: Molecule, m2: Molecule, strictMatching: boolean):
     
     const u = g1[idx];
     
-    const candidates = g2.filter(v => 
-      v.symbol === u.symbol && 
-      v.adj.length === u.adj.length && 
-      v.lonePairs === u.lonePairs && 
-      v.charge === u.charge && 
-      !mapped2.has(v.id)
-    );
+    const candidates = g2.filter(v => {
+      if (v.symbol !== u.symbol) return false;
+      if (v.adj.length !== u.adj.length) return false;
+      if (v.charge !== u.charge) return false;
+      if (mapped2.has(v.id)) return false;
+
+      // Check lone pairs:
+      if (v.lonePairs > 0) {
+        // If teacher answer explicitly specifies lone pairs, student must match exactly
+        if (u.lonePairs !== v.lonePairs) return false;
+      } else {
+        // Teacher has 0 lone pairs. Student can put 0, OR put the expected correct number of lone pairs.
+        if (u.lonePairs > 0) {
+          const bondingSum = u.adj.reduce((sum, e) => sum + (Number(e.order) === 4 || Number(e.order) === 5 ? 1 : Number(e.order)), 0);
+          const expected = getExpectedLonePairs(u.symbol, bondingSum, u.charge);
+          if (u.lonePairs !== expected) return false;
+        }
+      }
+
+      return true;
+    });
 
     for (const v of candidates) {
       let consistent = true;
@@ -210,11 +277,62 @@ function areMoleculesEqual(m1: Molecule, m2: Molecule, strictMatching: boolean):
   }
 }
 
+// Helpers for compressing Molecule payload for STACK Maxima Variables
+function shrinkMolecule(mol: Molecule): string {
+  const atomIds = mol.atoms.map(a => a.id);
+  const a = mol.atoms.map(at => [
+    at.symbol,
+    Math.round(at.x * 10) / 10,
+    Math.round(at.y * 10) / 10,
+    at.lonePairs || 0,
+    at.charge || 0
+  ]);
+  const b = mol.bonds.map(bt => {
+    const idx1 = atomIds.indexOf(bt.atom1Id);
+    const idx2 = atomIds.indexOf(bt.atom2Id);
+    return [Math.min(idx1, idx2), Math.max(idx1, idx2), bt.order];
+  });
+  
+  b.sort((b1, b2) => {
+    if (b1[0] !== b2[0]) return b1[0] - b2[0];
+    if (b1[1] !== b2[1]) return b1[1] - b2[1];
+    return b1[2] - b2[2];
+  });
+
+  return JSON.stringify({ a, b }).replace(/"/g, "'");
+}
+
 function parseTeacherAnswer(taString: string): Molecule | null {
   if (!taString || taString.trim() === '') return null;
   try {
-    const cleanTA = taString.trim();
+    let cleanTA = taString.trim();
+    if ((cleanTA.startsWith('"') && cleanTA.endsWith('"')) || (cleanTA.startsWith("'") && cleanTA.endsWith("'"))) {
+       cleanTA = cleanTA.substring(1, cleanTA.length - 1);
+    }
+    cleanTA = cleanTA.replace(/\\"/g, '"');
+    cleanTA = cleanTA.replace(/\\'/g, "'");
+    cleanTA = cleanTA.replace(/'/g, '"');
     const parsed = JSON.parse(cleanTA);
+    
+    // Check if compressed format
+    if (parsed.a && parsed.b && Array.isArray(parsed.a) && Array.isArray(parsed.b)) {
+      const atoms: Atom[] = parsed.a.map((at: any[]) => ({
+        id: crypto.randomUUID(),
+        symbol: at[0] as ElementType,
+        x: at[1],
+        y: at[2],
+        lonePairs: at[3],
+        charge: at[4]
+      }));
+      const bonds: Bond[] = parsed.b.map((bt: any[]) => ({
+        id: crypto.randomUUID(),
+        atom1Id: atoms[bt[0]].id,
+        atom2Id: atoms[bt[1]].id,
+        order: bt[2]
+      }));
+      return { atoms, bonds };
+    }
+
     if (parsed.visual && Array.isArray(parsed.visual.atoms)) {
       return parsed.visual as Molecule;
     }
@@ -222,7 +340,6 @@ function parseTeacherAnswer(taString: string): Molecule | null {
       return parsed as Molecule;
     }
   } catch (err) {
-    console.warn("Failed to parse TA string as JSON direct:", err);
     try {
       let cleaned = taString.trim();
       if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
@@ -230,7 +347,27 @@ function parseTeacherAnswer(taString: string): Molecule | null {
       }
       cleaned = cleaned.replace(/\\"/g, '"');
       cleaned = cleaned.replace(/\\'/g, "'");
+      cleaned = cleaned.replace(/'/g, '"');
       const parsed = JSON.parse(cleaned);
+
+      if (parsed.a && parsed.b && Array.isArray(parsed.a) && Array.isArray(parsed.b)) {
+        const atoms: Atom[] = parsed.a.map((at: any[]) => ({
+          id: crypto.randomUUID(),
+          symbol: at[0] as ElementType,
+          x: at[1],
+          y: at[2],
+          lonePairs: at[3],
+          charge: at[4]
+        }));
+        const bonds: Bond[] = parsed.b.map((bt: any[]) => ({
+          id: crypto.randomUUID(),
+          atom1Id: atoms[bt[0]].id,
+          atom2Id: atoms[bt[1]].id,
+          order: bt[2]
+        }));
+        return { atoms, bonds };
+      }
+
       if (parsed.visual && Array.isArray(parsed.visual.atoms)) {
         return parsed.visual as Molecule;
       }
@@ -238,16 +375,293 @@ function parseTeacherAnswer(taString: string): Molecule | null {
         return parsed as Molecule;
       }
     } catch (e2) {
-      console.warn("Failed second attempt to parse TA string:", e2);
+      // Ignore 
     }
   }
   return null;
 }
 
+type Language = 'Eng' | 'Heb' | 'Ara';
+
+const TRANSLATIONS = {
+  Eng: {
+    appTitle: "PeTeL Chem Editor",
+    undo: "Undo",
+    redo: "Redo",
+    cleanStructure: "Clean Structure",
+    instructorMode: "Instructor Mode",
+    studentMode: "Student Mode",
+    readOnly: "Read Only",
+    valencyWarnings: "Valency Warnings",
+    hideCH: "Hide C-H",
+    skeletal: "Skeletal",
+    filled: "Filled",
+    select: "Select",
+    atom: "Atom",
+    bond: "Bond",
+    chain: "Chain",
+    lonePairsBtn: "L-Pairs",
+    erase: "Erase",
+    clear: "Clear",
+    locked: "LOCKED",
+    scale: "Scale",
+    submissionCorrect: "Submission: Correct",
+    submissionIncorrect: "Submission: Incorrect",
+    answerFits: "Answer fits structural criteria",
+    unmatchedStructure: "Unmatched structure",
+    atomsCount: "Atoms count",
+    bondsCount: "Bonds count",
+    compositionAnalysis: "Composition Analysis",
+    element: "Element",
+    drawn: "Drawn",
+    correct: "Correct",
+    status: "Status",
+    matched: "Matched",
+    mismatch: "Mismatch",
+    noAnswerKey: "No Teacher Answer Key Parameters Loaded",
+    noAnswerSubtext: "The instructor has not submitted a correct answer code `TA` for evaluation yet.",
+    emptyCanvas: "Empty Canvas",
+    readyForExport: "Structure Modified - Ready for Export",
+    atoms: "Atoms",
+    bonds: "Bonds",
+    stackConnected: "STACK: Connected",
+    entityProperties: "Entity Properties",
+    entitiesSelected: "Entities Selected",
+    elementLabel: "Element",
+    bondLabel: "Bond",
+    reflectH: "Reflect H",
+    reflectV: "Reflect V",
+    rotateFreely: "Rotate Freely",
+    hybridization: "Hybridization",
+    charge: "Charge",
+    swapElement: "Swap Element",
+    order: "Order",
+    selectToInspect: "Select entity to inspect",
+    stackVerification: "STACK Verification",
+    stackMaximaString: "STACK Maxima 'ta' String",
+    compressed: "COMPRESSED",
+    publishAnswerKey: "Publish Answer Key",
+    syncedToQuestion: "Synced to Question",
+    savedGallery: "Saved Gallery",
+    strictMatch: "Strict Match Drawn H's",
+    noSavedStructures: "No saved structures",
+    compare: "Compare",
+    saveStructureBtn: "Save Structure",
+    clearAll: "Clear All",
+    exportPng: "Export as PNG",
+    downloadHtml: "Download App HTML",
+    saveTitle: "Save Structure",
+    cancelBtn: "CANCEL",
+    saveBtn: "SAVE",
+    otherElementTitle: "Other Element",
+    selectBtn: "SELECT",
+    drName: "Dr. Julian Sterling",
+    courseName: "Chemistry 101 Section B",
+    studentAccount: "Student Account",
+    interactiveAssignment: "Interactive assignment",
+    stopTesting: "Stop Testing Submitted",
+    testSubmitted: "Test Submitted State",
+    stackLinked: "STACK Linked"
+  },
+  Heb: {
+    appTitle: "עורך כימיה PeTeL",
+    undo: "בטל",
+    redo: "בצע שוב",
+    cleanStructure: "נקה מבנה",
+    instructorMode: "מצב מורה",
+    studentMode: "מצב תלמיד",
+    readOnly: "קריאה בלבד",
+    valencyWarnings: "אזהרות ערכיות",
+    hideCH: "הסתר C-H",
+    skeletal: "שלד",
+    filled: "מלא",
+    select: "בחר",
+    atom: "אטום",
+    bond: "קשר",
+    chain: "שרשרת",
+    lonePairsBtn: "זוגות אלק",
+    erase: "מחק",
+    clear: "נקה",
+    locked: "נעול",
+    scale: "קנה מידה",
+    submissionCorrect: "ההגשה נכונה",
+    submissionIncorrect: "ההגשה שגויה",
+    answerFits: "התשובה מתאימה למבנה",
+    unmatchedStructure: "מבנה לא תואם",
+    atomsCount: "מספר אטומים",
+    bondsCount: "מספר קשרים",
+    compositionAnalysis: "ניתוח הרכב",
+    element: "יסוד",
+    drawn: "מצויר",
+    correct: "נכון",
+    status: "סטטוס",
+    matched: "תואם",
+    mismatch: "לא תואם",
+    noAnswerKey: "לא נטען מפתח תשובות מהמורה",
+    noAnswerSubtext: "המורה עדיין לא הזין קוד `TA` לבדיקה.",
+    emptyCanvas: "קנבס ריק",
+    readyForExport: "המבנה שונה - מוכן לייצוא",
+    atoms: "אטומים",
+    bonds: "קשרים",
+    stackConnected: "STACK: מחובר",
+    entityProperties: "מאפייני ישות",
+    entitiesSelected: "ישויות נבחרו",
+    elementLabel: "יסוד",
+    bondLabel: "קשר",
+    reflectH: "שקף אופקית",
+    reflectV: "שקף אנכית",
+    rotateFreely: "סובב חופשי",
+    hybridization: "הכלאה",
+    charge: "מטען",
+    swapElement: "החלף יסוד",
+    order: "סדר קשר",
+    selectToInspect: "בחר ישות כדי לבחון",
+    stackVerification: "אימות STACK",
+    stackMaximaString: "מחרוזת 'ta' עבור STACK Maxima",
+    compressed: "דחוס",
+    publishAnswerKey: "פרסם מפתח תשובות",
+    syncedToQuestion: "סונכרן לשאלה",
+    savedGallery: "גלריה שמורות",
+    strictMatch: "התאמה קפדנית למימנים המצוירים",
+    noSavedStructures: "אין מבנים שמורים",
+    compare: "השווה",
+    saveStructureBtn: "שמור מבנה",
+    clearAll: "נקה הכל",
+    exportPng: "ייצא כ-PNG",
+    downloadHtml: "הורדת קובץ HTML",
+    saveTitle: "שמור מבנה",
+    cancelBtn: "ביטול",
+    saveBtn: "שמור",
+    otherElementTitle: "יסוד אחר",
+    selectBtn: "בחר",
+    drName: "Dr. Julian Sterling",
+    courseName: "Chemistry 101 Section B",
+    studentAccount: "חשבון תלמיד",
+    interactiveAssignment: "מטלה אינטראקטיבית",
+    stopTesting: "הפסק בדיקת ההגשה",
+    testSubmitted: "בדוק מצב מוגש",
+    stackLinked: "STACK מקושר"
+  },
+  Ara: {
+    appTitle: "محرر الكيمياء PeTeL",
+    undo: "تراجع",
+    redo: "إعادة",
+    cleanStructure: "تنظيف الهيكل",
+    instructorMode: "وضع المعلم",
+    studentMode: "وضع الطالب",
+    readOnly: "قراءة فقط",
+    valencyWarnings: "تحذيرات التكافؤ",
+    hideCH: "إخفاء C-H",
+    skeletal: "هيكل",
+    filled: "ممتلئ",
+    select: "تحديد",
+    atom: "ذرة",
+    bond: "رابطة",
+    chain: "سلسلة",
+    lonePairsBtn: "زوج إلك",
+    erase: "مسح",
+    clear: "مسح",
+    locked: "مغلق",
+    scale: "تكبير/تصغير",
+    submissionCorrect: "التسليم صحيح",
+    submissionIncorrect: "التسليم غير صحيح",
+    answerFits: "الإجابة تناسب المعايير الهيكلية",
+    unmatchedStructure: "هيكل غير متطابق",
+    atomsCount: "عدد الذرات",
+    bondsCount: "عدد الروابط",
+    compositionAnalysis: "تحليل التركيب",
+    element: "عنصر",
+    drawn: "مرسوم",
+    correct: "صحيح",
+    status: "الحالة",
+    matched: "متطابق",
+    mismatch: "عدم تطابق",
+    noAnswerKey: "لم يتم تحميل مفتاح إجابة المعلم",
+    noAnswerSubtext: "المعلم لم يقم بإرسال إجابة `TA` للتقييم بعد.",
+    emptyCanvas: "لوحة فارغة",
+    readyForExport: "تم تعديل الهيكل - جاهز للتصدير",
+    atoms: "ذرات",
+    bonds: "روابط",
+    stackConnected: "STACK: متصل",
+    entityProperties: "خصائص الكيان",
+    entitiesSelected: "كيانات محددة",
+    elementLabel: "عنصر",
+    bondLabel: "رابطة",
+    reflectH: "انعكاس أفقي",
+    reflectV: "انعكاس عمودي",
+    rotateFreely: "تدوير حر",
+    hybridization: "تهجين",
+    charge: "شحنة",
+    swapElement: "تبديل العنصر",
+    order: "رتبة الرابطة",
+    selectToInspect: "حدد كيانا للفحص",
+    stackVerification: "تحقق STACK",
+    stackMaximaString: "سلسلة STACK Maxima 'ta'",
+    compressed: "مضغوط",
+    publishAnswerKey: "نشر مفتاح الإجابات",
+    syncedToQuestion: "متزامن مع السؤال",
+    savedGallery: "المعرض المحفوظ",
+    strictMatch: "تطابق دقيق للـ H",
+    noSavedStructures: "لا توجد هياكل محفوظة",
+    compare: "قارن",
+    saveStructureBtn: "حفظ الهيكل",
+    clearAll: "مسح الكل",
+    exportPng: "تصدير بصيغة PNG",
+    downloadHtml: "تحميل ملف HTML",
+    saveTitle: "حفظ الهيكل",
+    cancelBtn: "إلغاء",
+    saveBtn: "حفظ",
+    otherElementTitle: "عنصر آخر",
+    selectBtn: "تحديد",
+    drName: "Dr. Julian Sterling",
+    courseName: "Chemistry 101 Section B",
+    studentAccount: "حساب طالب",
+    interactiveAssignment: "مهمة تفاعلية",
+    stopTesting: "إيقاف تقييم التسليم",
+    testSubmitted: "تقييم التسليم",
+    stackLinked: "STACK متصل"
+  }
+};
+
+const getInitialLang = (): Language => {
+  if (typeof window !== 'undefined') {
+    const params = new URLSearchParams(window.location.search);
+    let lang = params.get('lang') || params.get('LANG');
+    
+    // Check if there is a DOM element injected by Moodle/STACK
+    if (!lang) {
+      const langEl = document.getElementById('stack-lang-param');
+      if (langEl && langEl.textContent) {
+        const text = langEl.textContent.trim();
+        if (text && text.toLowerCase() !== 'lang' && !text.includes('{#')) {
+          lang = text;
+        }
+      }
+    }
+    
+    // Check global window variables
+    const globalWin = window as any;
+    if (!lang) {
+      lang = globalWin.__stackLang || globalWin.stackLang || globalWin.__stack_lang;
+    }
+
+    if (lang) {
+      const lower = lang.toLowerCase();
+      if (lower === 'heb' || lower === 'hebrew' || lower === 'he') return 'Heb';
+      if (lower === 'ara' || lower === 'arabic' || lower === 'ar') return 'Ara';
+      if (lower === 'eng' || lower === 'english' || lower === 'en') return 'Eng';
+    }
+  }
+  return 'Eng';
+};
+
 const TOOLBAR_ELEMENTS: ElementType[] = ['C', 'H', 'O', 'N', 'P', 'S', 'F', 'Cl', 'Br', 'I'];
-const BOND_ORDERS: (0 | 1 | 2 | 3)[] = [0, 1, 2, 3];
+const BOND_ORDERS: number[] = [0, 1, 2, 3, 4, 5];
 
 export default function App() {
+  const [language, setLanguage] = useState<Language>(getInitialLang());
+  const t = (key: keyof typeof TRANSLATIONS.Eng) => TRANSLATIONS[language][key] || TRANSLATIONS.Eng[key];
+
   const [historyState, setHistoryState] = useState({
     history: [{ atoms: [] as Atom[], bonds: [] as Bond[] }],
     index: 0
@@ -260,7 +674,7 @@ export default function App() {
   const [savedMolecules, setSavedMolecules] = useState<{id: string, name: string, data: Molecule}[]>([]);
   const [strictMatching, setStrictMatching] = useState(true);
   const [isStackEnvironment, setIsStackEnvironment] = useState(false);
-  const [mode, setMode] = useState<'atom' | 'bond' | 'erase' | 'select' | 'lone-pair' | 'charge'>('select');
+  const [mode, setMode] = useState<'atom' | 'bond' | 'chain' | 'erase' | 'select' | 'lone-pair' | 'charge'>('select');
   const [selectedElement, setSelectedElement] = useState<ElementType>('C');
   const [selectedBondOrder, setSelectedBondOrder] = useState<0 | 1 | 2 | 3>(1);
 
@@ -272,6 +686,85 @@ export default function App() {
 
   const [dragStartAtom, setDragStartAtom] = useState<string | null>(null);
   const dragStartAtomRef = useRef<string | null>(null);
+  
+  const [gradePanelOffset, setGradePanelOffset] = useState({ x: 0, y: 0 });
+  const isDraggingGradeRef = useRef(false);
+  const dragGradeStartRef = useRef({ x: 0, y: 0 });
+  const dragGradeInitialOffsetRef = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    const handleMove = (e: PointerEvent) => {
+      if (isDraggingGradeRef.current) {
+         setGradePanelOffset({
+           x: dragGradeInitialOffsetRef.current.x + (e.clientX - dragGradeStartRef.current.x),
+           y: dragGradeInitialOffsetRef.current.y + (e.clientY - dragGradeStartRef.current.y)
+         });
+      }
+    };
+    const handleUp = () => {
+      isDraggingGradeRef.current = false;
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+  }, []);
+
+  const { gradeResult, componentMatchResults, score } = useMemo(() => {
+    if (!teacherAnswer) return { gradeResult: null, componentMatchResults: [], score: null };
+    const fullGrade = areMoleculesEqual({ atoms, bonds }, teacherAnswer, strictMatching);
+    
+    // Calculate individual grading
+    const studentMolecules = getConnectedComponents(atoms, bonds);
+    const teacherMolecules = getConnectedComponents(teacherAnswer.atoms, teacherAnswer.bonds);
+    
+    const checkedTeacherIndices = new Set<number>();
+    
+    const matchResults = studentMolecules.map((smol) => {
+      const matchIndex = teacherMolecules.findIndex((tmol, j) => {
+        if (checkedTeacherIndices.has(j)) return false;
+        return areMoleculesEqual(smol, tmol, strictMatching).match;
+      });
+      
+      let isMatch = false;
+      if (matchIndex >= 0) {
+        isMatch = true;
+        checkedTeacherIndices.add(matchIndex);
+      }
+      
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      if (smol.atoms.length > 0) {
+        smol.atoms.forEach(a => {
+          minX = Math.min(minX, a.x);
+          maxX = Math.max(maxX, a.x);
+          minY = Math.min(minY, a.y);
+          maxY = Math.max(maxY, a.y);
+        });
+      } else {
+        minX = 0; maxX = 0; minY = 0; maxY = 0;
+      }
+      const cx = (minX + maxX) / 2;
+      const cy = minY - 50;
+      
+      return {
+        molecule: smol,
+        isMatch,
+        cx,
+        cy
+      };
+    });
+    
+    let matchCount = matchResults.filter(r => r.isMatch).length;
+    
+    let totalExpectedComponents = Math.max(teacherMolecules.length, studentMolecules.length);
+    let score = totalExpectedComponents > 0 ? matchCount / totalExpectedComponents : (fullGrade.match ? 1 : 0);
+    // STACK might expect score to be capped at 1
+    score = Math.min(1, Math.max(0, score));
+
+    return { gradeResult: fullGrade, componentMatchResults: matchResults, score };
+  }, [atoms, bonds, teacherAnswer, strictMatching]);
 
   const [draggingAtomIds, setDraggingAtomIds] = useState<string[]>([]);
   const dragInitialMouseRef = useRef<{x: number, y: number} | null>(null);
@@ -289,6 +782,7 @@ export default function App() {
   const selectedEntityIdsRef = useRef<string[]>([]);
   const [scale, setScale] = useState(1.0);
   const [hideCHydrogens, setHideCHydrogens] = useState(false);
+  const [showValencyWarnings, setShowValencyWarnings] = useState(false);
   const [skeletalMode, setSkeletalMode] = useState(false);
   const hideImplicitHydrogens = true;
   const [filledMode, setFilledMode] = useState(true);
@@ -312,7 +806,17 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     
     // Check design variable (1 = instructor, others = student)
-    const designParam = params.get('design') || params.get('DESIGN');
+    let designParam = params.get('design') || params.get('DESIGN');
+    if (!designParam) {
+      const designEl = document.getElementById('stack-design-param');
+      if (designEl && designEl.textContent) {
+        const text = designEl.textContent.trim();
+        if (text && text.toLowerCase() !== 'design' && !text.includes('{#')) {
+           designParam = text;
+        }
+      }
+    }
+
     if (designParam !== null) {
       setIsInstructor(designParam === '1' || designParam.toLowerCase() === 'true' || designParam.toLowerCase() === 'instructor');
     } else {
@@ -325,12 +829,45 @@ export default function App() {
     }
 
     // Check teacherAnswer variable (TA)
-    const taParam = params.get('ta') || params.get('TA');
+    let taParam = params.get('ta') || params.get('TA');
+    if (!taParam) {
+      const taEl = document.getElementById('stack-ta-param');
+      if (taEl && taEl.textContent) {
+        const text = taEl.textContent.trim();
+        if (text && text.toLowerCase() !== 'ta' && !text.includes('{#')) {
+           taParam = text;
+        }
+      }
+    }
+
     if (taParam) {
       const parsed = parseTeacherAnswer(taParam);
       if (parsed) {
         setTeacherAnswer(parsed);
       }
+    }
+
+    // Check lang variable (LANG/lang)
+    let langParam = params.get('lang') || params.get('LANG');
+    if (!langParam) {
+      const langEl = document.getElementById('stack-lang-param');
+      if (langEl && langEl.textContent) {
+        const text = langEl.textContent.trim();
+        if (text && text.toLowerCase() !== 'lang' && !text.includes('{#')) {
+          langParam = text;
+        }
+      }
+    }
+    const globalWin = window as any;
+    if (!langParam) {
+      langParam = globalWin.__stackLang || globalWin.stackLang || globalWin.__stack_lang;
+    }
+
+    if (langParam) {
+      const lower = langParam.toLowerCase();
+      if (lower === 'heb' || lower === 'hebrew' || lower === 'he') setLanguage('Heb');
+      else if (lower === 'ara' || lower === 'arabic' || lower === 'ar') setLanguage('Ara');
+      else if (lower === 'eng' || lower === 'english' || lower === 'en') setLanguage('Eng');
     }
   }, []);
 
@@ -359,17 +896,41 @@ export default function App() {
     selectedBondOrderRef.current = selectedBondOrder;
     selectedEntityIdsRef.current = selectedEntityIds;
     
+    const atomIds = atoms.map(a => a.id);
+    const a = atoms.map(at => [
+      at.symbol,
+      Math.round(at.x * 10) / 10,
+      Math.round(at.y * 10) / 10,
+      at.lonePairs || 0,
+      at.charge || 0
+    ]);
+    const b = bonds.map(bt => {
+      const idx1 = atomIds.indexOf(bt.atom1Id);
+      const idx2 = atomIds.indexOf(bt.atom2Id);
+      return [Math.min(idx1, idx2), Math.max(idx1, idx2), bt.order];
+    });
+    b.sort((b1, b2) => {
+      if (b1[0] !== b2[0]) return b1[0] - b2[0];
+      if (b1[1] !== b2[1]) return b1[1] - b2[1];
+      return b1[2] - b2[2];
+    });
+    
+    const payload: any = { a, b };
+    if (score !== null) {
+      payload._score = score;
+    }
+
     window.dispatchEvent(new CustomEvent('molecule-changed', {
-      detail: { atoms, bonds }
+      detail: payload
     }));
-  }, [atoms, bonds, draftState, mode, selectedElement, selectedBondOrder, selectedEntityIds]);
+  }, [atoms, bonds, draftState, mode, selectedElement, selectedBondOrder, selectedEntityIds, score]);
 
   useEffect(() => {
     const handleStackLoad = (e: Event) => {
       try {
         const detail = (e as CustomEvent).detail;
         if (typeof detail === 'string' && detail.trim() !== '') {
-          const parsed = JSON.parse(detail);
+          const parsed = parseTeacherAnswer(detail);
           console.log("Loaded STACK molecule:", parsed);
           if (parsed && parsed.atoms && parsed.bonds) {
              setHistoryState({
@@ -526,10 +1087,11 @@ export default function App() {
   };
 
   const handleSvgPointerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
     if (isReadOnly || testReadOnlyMode) return;
     const { x, y } = getSvgCoords(e);
 
-    if (mode === 'atom') {
+    if (mode === 'atom' || mode === 'chain') {
       const newAtom: Atom = {
         id: crypto.randomUUID(),
         symbol: selectedElement,
@@ -540,6 +1102,12 @@ export default function App() {
       };
       updateState([...atoms, newAtom], bonds);
       setSelectedEntityIds([newAtom.id]);
+      if (mode === 'chain') {
+        dragStartAtomRef.current = newAtom.id;
+        setDragStartAtom(newAtom.id);
+      }
+    } else if (mode !== 'select') {
+      setMode('select');
     } else if (mode === 'select') {
       selectionBoxStartRef.current = { x, y };
       setSelectionBoxStart({ x, y });
@@ -555,6 +1123,7 @@ export default function App() {
   };
 
   const handleAtomPointerDown = (e: React.PointerEvent, atomId: string) => {
+    e.preventDefault();
     e.stopPropagation();
     if (isReadOnly || testReadOnlyMode) return;
     
@@ -572,7 +1141,7 @@ export default function App() {
       dragInitialMouseRef.current = getSvgCoords(e);
       dragInitialAtomsRef.current = atoms.filter(a => idsToDrag.includes(a.id));
       dragHasMovedRef.current = false;
-    } else if (mode === 'bond' || mode === 'atom') {
+    } else if (mode === 'bond' || mode === 'atom' || mode === 'chain') {
       setSelectedEntityIds([atomId]);
       dragStartAtomRef.current = atomId;
       setDragStartAtom(atomId);
@@ -595,51 +1164,17 @@ export default function App() {
     }
   };
 
-  const handleAtomPointerUp = (e: React.PointerEvent, atomId: string) => {
-    e.stopPropagation();
-    if ((mode === 'bond' || mode === 'atom') && dragStartAtomRef.current && dragStartAtomRef.current !== atomId) {
-      const existingBondIndex = bonds.findIndex(b => 
-        (b.atom1Id === dragStartAtomRef.current && b.atom2Id === atomId) ||
-        (b.atom1Id === atomId && b.atom2Id === dragStartAtomRef.current)
-      );
-
-      if (existingBondIndex >= 0) {
-        const newBonds = [...bonds];
-        newBonds[existingBondIndex] = {
-          ...newBonds[existingBondIndex],
-          order: ((newBonds[existingBondIndex].order + 1) % 4) as 0 | 1 | 2 | 3
-        };
-        updateState(atoms, newBonds);
-      } else {
-        const newBond: Bond = {
-          id: crypto.randomUUID(),
-          atom1Id: dragStartAtomRef.current,
-          atom2Id: atomId,
-          order: selectedBondOrder,
-        };
-        updateState(atoms, [...bonds, newBond]);
-      }
-    } else if (mode === 'atom' && dragStartAtomRef.current === atomId) {
-      updateState(atoms.map(a => 
-        a.id === atomId ? { ...a, symbol: selectedElement } : a
-      ), bonds);
-    }
-    
-    dragStartAtomRef.current = null;
-    setDragStartAtom(null);
-    setDraggingAtomIds([]);
-  };
-
   const handleBondPointerDown = (e: React.PointerEvent, bondId: string) => {
+    e.preventDefault();
     e.stopPropagation();
     if (isReadOnly || testReadOnlyMode) return;
     setSelectedEntityIds([bondId]);
     if (mode === 'erase') {
       updateState(atoms, bonds.filter(b => b.id !== bondId));
       if (selectedEntityIds.includes(bondId)) setSelectedEntityIds(selectedEntityIds.filter(id => id !== bondId));
-    } else if (mode === 'bond') {
+    } else if (mode === 'bond' || mode === 'atom') {
       updateState(atoms, bonds.map(b => 
-        b.id === bondId ? { ...b, order: ((b.order + 1) % 4) as 0 | 1 | 2 | 3 } : b
+        b.id === bondId ? { ...b, order: (b.order + 1) % 6 } : b
       ));
     }
   };
@@ -714,7 +1249,7 @@ export default function App() {
          // Find if we released over an existing atom (for touch support)
          const targetAtom = stateRef.current.atoms.find(a => {
             const d = Math.hypot(coords.x - a.x, coords.y - a.y);
-            return d < 25 && a.id !== dragStartAtomRef.current;
+            return d < (ATOM_RADII[a.symbol] || 20) + 15 && a.id !== dragStartAtomRef.current;
          });
 
          if (targetAtom) {
@@ -730,7 +1265,7 @@ export default function App() {
               const newBonds = [...stateRef.current.bonds];
               newBonds[existingBondIndex] = {
                 ...newBonds[existingBondIndex],
-                order: ((newBonds[existingBondIndex].order + 1) % 4) as 0 | 1 | 2 | 3
+                order: (newBonds[existingBondIndex].order + 1) % 6
               };
               updateState(stateRef.current.atoms, newBonds);
             } else {
@@ -742,8 +1277,62 @@ export default function App() {
               };
               updateState(stateRef.current.atoms, [...stateRef.current.bonds, newBond]);
             }
+         } else if (modeRef.current === 'chain') {
+           const startAtom = stateRef.current.atoms.find(a => a.id === dragStartAtomRef.current);
+           if (startAtom) {
+             const dx = coords.x - startAtom.x;
+             const dy = coords.y - startAtom.y;
+             const dist = Math.hypot(dx, dy);
+             if (dist > 20) {
+               const B = 35;
+               const projectedLength = B * Math.cos(Math.PI / 6);
+               const numBonds = Math.max(1, Math.round(dist / projectedLength));
+               const axisAngle = Math.atan2(dy, dx);
+               
+               let currentPt = { x: startAtom.x, y: startAtom.y };
+               let goingUp = true;
+               
+               let newAtoms: Atom[] = [];
+               let newBonds: Bond[] = [];
+               
+               let lastAtomId = startAtom.id;
+               
+               for (let i = 0; i < numBonds; i++) {
+                 const bondAngle = axisAngle + (goingUp ? Math.PI/6 : -Math.PI/6);
+                 const nextX = currentPt.x + B * Math.cos(bondAngle);
+                 const nextY = currentPt.y + B * Math.sin(bondAngle);
+                 
+                 const newAtomId = crypto.randomUUID();
+                 newAtoms.push({
+                   id: newAtomId,
+                   symbol: selectedElementRef.current,
+                   x: nextX,
+                   y: nextY,
+                   charge: 0,
+                   lonePairs: 0
+                 });
+                 newBonds.push({
+                   id: crypto.randomUUID(),
+                   atom1Id: lastAtomId,
+                   atom2Id: newAtomId,
+                   order: selectedBondOrderRef.current
+                 });
+                 
+                 lastAtomId = newAtomId;
+                 currentPt = { x: nextX, y: nextY };
+                 goingUp = !goingUp;
+               }
+               
+               updateState([...stateRef.current.atoms, ...newAtoms], [...stateRef.current.bonds, ...newBonds]);
+               setSelectedEntityIds(newAtoms.map(a => a.id));
+             } else {
+               updateState(stateRef.current.atoms.map(a => 
+                 a.id === dragStartAtomRef.current ? { ...a, symbol: selectedElementRef.current } : a
+               ), stateRef.current.bonds);
+             }
+           }
          } else if (modeRef.current === 'atom' || modeRef.current === 'bond') {
-           // Create new atom and bond
+           // Create new atom and bond, or change symbol if clicked
            const startAtom = stateRef.current.atoms.find(a => a.id === dragStartAtomRef.current);
            if (startAtom) {
              const dist = Math.hypot(coords.x - startAtom.x, coords.y - startAtom.y);
@@ -764,6 +1353,11 @@ export default function App() {
                };
                updateState([...stateRef.current.atoms, newAtom], [...stateRef.current.bonds, newBond]);
                setSelectedEntityIds([newAtom.id]);
+             } else if (modeRef.current === 'atom') {
+               // Clicked on the same atom, update its symbol
+               updateState(stateRef.current.atoms.map(a => 
+                 a.id === dragStartAtomRef.current ? { ...a, symbol: selectedElementRef.current } : a
+               ), stateRef.current.bonds);
              }
            }
          }
@@ -775,9 +1369,11 @@ export default function App() {
 
     window.addEventListener('pointermove', handleGlobalPointerMove);
     window.addEventListener('pointerup', handleGlobalPointerUp);
+    window.addEventListener('pointercancel', handleGlobalPointerUp);
     return () => {
       window.removeEventListener('pointermove', handleGlobalPointerMove);
       window.removeEventListener('pointerup', handleGlobalPointerUp);
+      window.removeEventListener('pointercancel', handleGlobalPointerUp);
     };
   }, [draggingAtomIds]);
 
@@ -805,39 +1401,7 @@ export default function App() {
   }, [atoms, bonds, selectedEntityIds]);
 
   const exportData = useMemo(() => {
-    const atomIndices = new Map<string, number>(atoms.map((a, i) => [a.id, i]));
-    
-    // Sort bonds so atom1 index < atom2 index for a more normalized topology output
-    const normalizedBonds = bonds.map(b => {
-      const idx1 = atomIndices.get(b.atom1Id) ?? -1;
-      const idx2 = atomIndices.get(b.atom2Id) ?? -1;
-      return {
-        atom1: Math.min(idx1, idx2),
-        atom2: Math.max(idx1, idx2),
-        order: b.order
-      };
-    });
-    
-    // Sort array to ensure predictable bond order
-    normalizedBonds.sort((a, b) => {
-      if (a.atom1 !== b.atom1) return a.atom1 - b.atom1;
-      if (a.atom2 !== b.atom2) return a.atom2 - b.atom2;
-      return a.order - b.order;
-    });
-
-    const grading = {
-      atoms: atoms.map(a => ({
-        symbol: a.symbol,
-        charge: a.charge,
-        lonePairs: a.lonePairs
-      })),
-      bonds: normalizedBonds
-    };
-    
-    return JSON.stringify({ 
-      visual: { atoms, bonds }, 
-      grading 
-    }, null, 2);
+    return shrinkMolecule({ atoms, bonds });
   }, [atoms, bonds]);
 
   useEffect(() => {
@@ -945,14 +1509,41 @@ export default function App() {
   const getAtomValency = (atomId: string) => {
     return bonds
       .filter(b => b.atom1Id === atomId || b.atom2Id === atomId)
-      .reduce((sum, b) => sum + b.order, 0);
+      .reduce((sum, b) => sum + (Number(b.order) === 4 || Number(b.order) === 5 ? 1 : Number(b.order)), 0);
   };
 
   const getExpectedValency = (symbol: ElementType) => {
     const valencies: Record<string, number> = {
-      C: 4, N: 3, O: 2, H: 1, F: 1, Cl: 1, Br: 1, I: 1, P: 5, S: 6
+      C: 4, N: 3, O: 2, H: 1, F: 1, Cl: 1, Br: 1, I: 1, P: 3, S: 2
     };
     return valencies[symbol] || 0;
+  };
+
+  const getChainPreview = (startX: number, startY: number, endX: number, endY: number) => {
+    const dx = endX - startX;
+    const dy = endY - startY;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= 20) return [];
+    
+    const B = 35;
+    const projectedLength = B * Math.cos(Math.PI / 6);
+    const numBonds = Math.max(1, Math.round(dist / projectedLength));
+    
+    const axisAngle = Math.atan2(dy, dx);
+    const pts = [{ x: startX, y: startY }];
+    
+    let currentPt = { x: startX, y: startY };
+    let goingUp = true;
+    for (let i = 0; i < numBonds; i++) {
+       const bondAngle = axisAngle + (goingUp ? Math.PI/6 : -Math.PI/6);
+       currentPt = {
+         x: currentPt.x + B * Math.cos(bondAngle),
+         y: currentPt.y + B * Math.sin(bondAngle)
+       };
+       pts.push(currentPt);
+       goingUp = !goingUp;
+    }
+    return pts;
   };
 
   const saveMolecule = () => {
@@ -1050,7 +1641,7 @@ export default function App() {
                else if (!filledMode) base = 8;
                else base = (ATOM_RADII[atom.symbol] || 20) + 1;
                
-               if (b.order === 0 && atom.symbol !== 'H') {
+               if (Number(b.order) === 0 && atom.symbol !== 'H') {
                  base += 4;
                }
                return base;
@@ -1065,17 +1656,29 @@ export default function App() {
              const strokeWidth = 2;
              const spacing = 3;
              
-             if (b.order === 0) {
+             const order = Number(b.order);
+             if (order === 0) {
                 lines = `<line x1="0" y1="0" x2="${bondLength}" y2="0" stroke="${color}" stroke-width="${strokeWidth}" stroke-dasharray="4 4" stroke-linecap="round" />`;
-             } else if (b.order === 1) {
+             } else if (order === 1) {
                 lines = `<line x1="0" y1="0" x2="${bondLength}" y2="0" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" />`;
-             } else if (b.order === 2) {
+             } else if (order === 2) {
                 lines = `<line x1="0" y1="${-spacing/2}" x2="${bondLength}" y2="${-spacing/2}" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" />
                         <line x1="0" y1="${spacing/2}" x2="${bondLength}" y2="${spacing/2}" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" />`;
-             } else {
+             } else if (order === 3) {
                 lines = `<line x1="0" y1="${-spacing}" x2="${bondLength}" y2="${-spacing}" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" />
                         <line x1="0" y1="0" x2="${bondLength}" y2="0" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" />
                         <line x1="0" y1="${spacing}" x2="${bondLength}" y2="${spacing}" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" />`;
+             } else if (order === 4) {
+                lines = `<polygon points="0,0 ${bondLength},${-spacing*1.2} ${bondLength},${spacing*1.2}" fill="${color}" />`;
+             } else if (order === 5) {
+                const numDashes = 7;
+                let dashes = '';
+                for (let i = 1; i <= numDashes; i++) {
+                  const x = (bondLength / numDashes) * i;
+                  const h = (spacing * 1.5) * (i / numDashes);
+                  dashes += `<line x1="${x}" y1="${-h}" x2="${x}" y2="${h}" stroke="${color}" stroke-width="2" stroke-linecap="round" />`;
+                }
+                lines = dashes;
              }
              
              return `<g transform="translate(${a1.x}, ${a1.y}) rotate(${angle}) translate(${offset1}, 0)">${lines}</g>`;
@@ -1096,7 +1699,7 @@ export default function App() {
             
             const textColor = shouldDrawFill ? baseTextColor : unfilledTextColor;
             
-            const currentV = bonds.filter(b => b.atom1Id === a.id || b.atom2Id === a.id).reduce((sum, b) => sum + b.order, 0);
+            const currentV = bonds.filter(b => b.atom1Id === a.id || b.atom2Id === a.id).reduce((sum, b) => sum + (Number(b.order) === 4 || Number(b.order) === 5 ? 1 : Number(b.order)), 0);
             const expectedV = getExpectedValency(a.symbol);
             const implicitH = Math.max(0, expectedV - currentV);
             const shouldHideImplicitH = hideImplicitHydrogens || ((hideCHydrogens || skeletalMode) && a.symbol === 'C');
@@ -1104,13 +1707,110 @@ export default function App() {
             let implicitHText = '';
             if (a.symbol !== 'H' && implicitH > 0 && !shouldHideImplicitH) {
                 const hTextColor = shouldDrawFill ? (color === '#ffffff' ? '#64748b' : color) : textColor;
-                implicitHText = `<text x="14" y="14" fill="${hTextColor}" font-size="10" font-weight="bold" font-family="sans-serif">H${implicitH > 1 ? implicitH : ''}</text>`;
+                const hX = a.x + ((ATOM_RADII[a.symbol] || 20) * 0.7);
+                const hY = a.y + ((ATOM_RADII[a.symbol] || 20) * 0.7);
+                implicitHText = `<text x="${hX}" y="${hY}" fill="${hTextColor}" font-size="14" font-weight="bold" font-family="sans-serif">H${implicitH > 1 ? implicitH : ''}</text>`;
             }
 
-            return `<g transform="translate(${a.x}, ${a.y})">
-              <circle r="16" fill="${circleFill}" stroke="white" stroke-width="2" />
-              <text text-anchor="middle" dominant-baseline="central" fill="${textColor}" font-size="14" font-weight="bold" font-family="sans-serif">${a.symbol}</text>
+            let chargeText = '';
+            if (a.charge !== 0) {
+               const cx = a.x + ((ATOM_RADII[a.symbol] || 20) * 0.7);
+               const cy = a.y - ((ATOM_RADII[a.symbol] || 20) * 0.7);
+               chargeText = `
+                 <g transform="translate(${cx}, ${cy})">
+                   <circle r="7" fill="${a.charge > 0 ? "#10b981" : "#ef4444"}" />
+                   <text dy="0.35em" text-anchor="middle" fill="white" font-size="9" font-weight="900" font-family="sans-serif">${a.charge > 0 ? "+" : "-"}</text>
+                 </g>
+               `;
+            }
+
+            // Lone pairs logic
+            let lonePairsHtml = '';
+            if (a.lonePairs > 0) {
+              const connectedBonds = bonds.filter(b => b.atom1Id === a.id || b.atom2Id === a.id);
+              const hBonds = connectedBonds.filter(b => b.order === 0);
+              const covBonds = connectedBonds.filter(b => b.order > 0);
+
+              const getAngle = (b: Bond) => {
+                const otherId = b.atom1Id === a.id ? b.atom2Id : b.atom1Id;
+                const other = targetAtoms.find(t => t.id === otherId) || atoms.find(t => t.id === otherId);
+                if (!other) return null;
+                return Math.atan2(other.y - a.y, other.x - a.x);
+              };
+
+              const hBondAngles = hBonds.map(getAngle).filter((a): a is number => a !== null);
+              const covBondAngles = covBonds.map(getAngle).filter((a): a is number => a !== null);
+
+              let availableAngles: number[] = [...hBondAngles];
+
+              if (covBondAngles.length === 0) {
+                if (a.lonePairs === 1) {
+                  availableAngles.push(-Math.PI/2);
+                } else if (a.lonePairs === 2) {
+                  availableAngles.push(-Math.PI * 3/4, -Math.PI / 4);
+                } else {
+                  availableAngles.push(...[-Math.PI/2, 0, Math.PI/2, Math.PI]);
+                }
+              } else if (covBondAngles.length === 1) {
+                const angle = covBondAngles[0];
+                availableAngles.push(...[angle + Math.PI, angle + Math.PI/2, angle - Math.PI/2, angle + Math.PI * 3/4]);
+              } else {
+                const sorted = [...covBondAngles].sort((x, y) => x - y);
+                const gaps = [];
+                for (let i = 0; i < sorted.length; i++) {
+                  const next = sorted[(i + 1) % sorted.length];
+                  let diff = next - sorted[i];
+                  if (diff < 0) diff += 2 * Math.PI;
+                  gaps.push({ start: sorted[i], diff });
+                }
+                gaps.sort((x, y) => y.diff - x.diff);
+                if (gaps[0].diff > Math.PI) {
+                  const mid = gaps[0].start + gaps[0].diff / 2;
+                  const spread = 135 * Math.PI / 180;
+                  availableAngles.push(mid - spread / 2);
+                  availableAngles.push(mid + spread / 2);
+                  if (gaps.length > 1) availableAngles.push(gaps[1].start + gaps[1].diff / 2);
+                  availableAngles.push(mid);
+                } else {
+                  gaps.forEach(g => availableAngles.push(g.start + g.diff / 2));
+                }
+              }
+
+              const getBaseR = () => {
+                if (isSkeletalC) return 0;
+                if (!filledMode) return 9;
+                return ATOM_RADII[a.symbol] || 20;
+              };
+              const baseR = getBaseR();
+              const radius = baseR + 2;
+              const dotSize = 2.0;
+              const pairSpread = 8.0;
+
+              for (let i = 0; i < a.lonePairs; i++) {
+                let angle = availableAngles[i % availableAngles.length] || 0;
+                let bx = Math.cos(angle) * radius;
+                let by = Math.sin(angle) * radius;
+                let px = Math.cos(angle + Math.PI/2) * (pairSpread / 2);
+                let py = Math.sin(angle + Math.PI/2) * (pairSpread / 2);
+
+                lonePairsHtml += `
+                  <g>
+                    <circle cx="${a.x + bx + px}" cy="${a.y + by + py}" r="${dotSize}" fill="#6366F1" />
+                    <circle cx="${a.x + bx - px}" cy="${a.y + by - py}" r="${dotSize}" fill="#6366F1" />
+                  </g>
+                `;
+              }
+            }
+
+            const strokeCol = shouldDrawFill ? "white" : "transparent";
+            return `<g>
+              <g transform="translate(${a.x}, ${a.y})">
+                <circle r="${ATOM_RADII[a.symbol] || 20}" fill="${circleFill}" stroke="${strokeCol}" stroke-width="2" />
+                <text text-anchor="middle" dominant-baseline="central" fill="${textColor}" font-size="20" font-weight="900" font-family="sans-serif" letter-spacing="-0.05em">${a.symbol}</text>
+              </g>
               ${implicitHText}
+              ${chargeText}
+              ${lonePairsHtml}
             </g>`;
           }).join('')}
         </g>
@@ -1121,13 +1821,15 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => {
+      const scaleFactor = 4;
       const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
+      canvas.width = width * scaleFactor;
+      canvas.height = height * scaleFactor;
       const ctx = canvas.getContext('2d');
       if (ctx) {
+        ctx.scale(scaleFactor, scaleFactor);
         ctx.drawImage(img, 0, 0);
-        const pngUrl = canvas.toDataURL("image/png");
+        const pngUrl = canvas.toDataURL("image/png", 1.0);
         const a = document.createElement("a");
         a.download = "molecule.png";
         a.href = pngUrl;
@@ -1316,7 +2018,7 @@ export default function App() {
                         } else if (a.symbol === 'H') {
                             tAngle = Math.PI;
                         } else {
-                            const totalOrder = bonds.filter(b => b.atom1Id === a.id || b.atom2Id === a.id).reduce((sum, b) => sum + b.order, 0);
+                            const totalOrder = bonds.filter(b => b.atom1Id === a.id || b.atom2Id === a.id).reduce((sum, b) => sum + (Number(b.order) === 4 || Number(b.order) === 5 ? 1 : Number(b.order)), 0);
                             if (totalOrder === 4) tAngle = Math.PI; // sp hybridized
                             else tAngle = targetAngle;
                         }
@@ -1482,38 +2184,41 @@ export default function App() {
     }));
   }, [atoms, teacherAnswer]);
 
-  const gradeResult = useMemo(() => {
-    if (!teacherAnswer) return null;
-    return areMoleculesEqual({ atoms, bonds }, teacherAnswer, strictMatching);
-  }, [atoms, bonds, teacherAnswer, strictMatching]);
-
   const isStudentMode = isStackEnvironment && !isInstructor;
+  const isRTL = language === 'Heb' || language === 'Ara';
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-white font-sans text-slate-900">
+    <div className="flex flex-col h-screen overflow-hidden bg-white font-sans text-slate-900" dir={isRTL ? "rtl" : "ltr"}>
       {/* Header Navigation */}
-      <header className="h-14 bg-white border-b border-slate-200 flex items-center justify-between px-4 shrink-0 shadow-sm z-20">
-        <div className="flex items-center space-x-4">
-          <div className="flex items-center space-x-2">
-            <div className="w-8 h-8 bg-indigo-600 rounded flex items-center justify-center text-white font-bold text-xl ring-2 ring-indigo-100">C</div>
-            <span className="font-bold tracking-tight text-lg text-slate-800 animate-fade-in">ChemConnect Studio</span>
+      <header className="h-14 bg-white border-b border-slate-200 flex items-center justify-between px-4 shrink-0 shadow-sm z-20 overflow-hidden">
+        <div className="flex items-center space-x-4 flex-1 min-w-0">
+          <div className="flex items-center space-x-2 shrink-0">
+            <div className="w-10 h-10 bg-indigo-50 rounded-lg flex items-center justify-center text-indigo-600 ring-1 ring-indigo-200 shadow-sm overflow-hidden">
+              <svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                <polygon points="50,10 85,30 85,70 50,90 15,70 15,30" fill="none" stroke="currentColor" strokeWidth="8" strokeLinejoin="round" />
+                <line x1="28" y1="38" x2="28" y2="62" stroke="currentColor" strokeWidth="6" strokeLinecap="round" />
+                <line x1="48" y1="24" x2="72" y2="38" stroke="currentColor" strokeWidth="6" strokeLinecap="round" />
+                <line x1="48" y1="76" x2="72" y2="62" stroke="currentColor" strokeWidth="6" strokeLinecap="round" />
+              </svg>
+            </div>
+            <span className="font-bold tracking-tight text-lg text-slate-800 animate-fade-in hidden sm:block">{t('appTitle')}</span>
           </div>
-          <nav className="flex space-x-1 ml-6 h-full items-center">
+          <nav className="flex space-x-1 ml-2 sm:ml-6 h-full items-center overflow-x-auto whitespace-nowrap [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden pr-2 flex-1">
             <button 
               onClick={undo} 
               disabled={historyState.index === 0 || testReadOnlyMode || isReadOnly}
               className="flex items-center px-3 py-1.5 text-sm font-medium rounded text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Undo last action"
+              title={t('undo')}
             >
-              <RotateCcw className="w-4 h-4 mr-1.5" /> Undo
+              <RotateCcw className="w-6 h-6 mr-1.5" /> {t('undo')}
             </button>
             <button 
               onClick={redo} 
               disabled={historyState.index === historyState.history.length - 1 || testReadOnlyMode || isReadOnly}
               className="flex items-center px-3 py-1.5 text-sm font-medium rounded text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Redo previous action"
+              title={t('redo')}
             >
-              <RotateCcw className="w-4 h-4 mr-1.5 transform scale-x-[-1]" /> Redo
+              <RotateCcw className="w-6 h-6 mr-1.5 transform scale-x-[-1]" /> {t('redo')}
             </button>
             
             <div className="w-px h-6 bg-slate-200 mx-2"></div>
@@ -1522,40 +2227,33 @@ export default function App() {
               onClick={cleanStructure}
               disabled={testReadOnlyMode || isReadOnly}
               className="group flex items-center px-3 py-1.5 text-sm font-semibold rounded text-blue-600 hover:bg-blue-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Optimize 2D visual layout of drawn structure"
+              title={t('cleanStructure')}
             >
-              <span className="mr-1.5 group-hover:animate-pulse">🪄</span> Clean Structure
+              <Wand2 className="w-4 h-4 mr-1.5 group-hover:animate-pulse" /> {t('cleanStructure')}
             </button>
 
-            {isInstructor ? (
-              <span className="px-2 py-1 text-[10px] font-black uppercase text-amber-700 bg-amber-50 border border-amber-200 rounded-md ml-4 tracking-wider flex items-center gap-1 shrink-0 select-none">
+            {isInstructor && (
+              <span className="px-2 py-1 text-base font-black uppercase text-amber-700 bg-amber-50 border border-amber-200 rounded-md ml-4 tracking-wider flex items-center gap-1 shrink-0 select-none">
                 <span className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse" />
-                Instructor Mode
-              </span>
-            ) : isStudentMode ? (
-              <span className="px-2 py-1 text-[10px] font-black uppercase text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-md ml-4 tracking-wider flex items-center gap-1 shrink-0 select-none">
-                <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-pulse" />
-                Student Mode
-              </span>
-            ) : null}
-
-            {isReadOnly && (
-              <span className="px-2 py-1 text-[10px] font-bold uppercase text-rose-700 bg-rose-50 border border-rose-200 rounded-md ml-4 tracking-wider select-none shrink-0" title="Read Only — Evaluation Display">
-                Read Only
+                {t('instructorMode')}
               </span>
             )}
             
-            <label className="flex items-center space-x-2 text-xs font-semibold text-slate-600 ml-4 cursor-pointer">
+            <label className="flex items-center space-x-2 text-sm font-semibold text-slate-600 ml-4 cursor-pointer">
               <input type="checkbox" checked={hideCHydrogens} onChange={(e) => setHideCHydrogens(e.target.checked)} className="rounded text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5" />
-              <span>Hide C-H</span>
+              <span>{t('hideCH')}</span>
             </label>
-            <label className="flex items-center space-x-2 text-xs font-semibold text-slate-600 ml-4 cursor-pointer">
+            <label className="flex items-center space-x-2 text-sm font-semibold text-slate-600 ml-4 cursor-pointer">
+              <input type="checkbox" checked={showValencyWarnings} onChange={(e) => setShowValencyWarnings(e.target.checked)} className="rounded text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5" />
+              <span>{t('valencyWarnings')}</span>
+            </label>
+            <label className="flex items-center space-x-2 text-sm font-semibold text-slate-600 ml-4 cursor-pointer">
               <input type="checkbox" checked={skeletalMode} onChange={(e) => setSkeletalMode(e.target.checked)} className="rounded text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5" />
-              <span>Skeletal</span>
+              <span>{t('skeletal')}</span>
             </label>
-            <label className="flex items-center space-x-2 text-xs font-semibold text-slate-600 ml-4 cursor-pointer">
+            <label className="flex items-center space-x-2 text-sm font-semibold text-slate-600 ml-4 cursor-pointer">
               <input type="checkbox" checked={filledMode} onChange={(e) => setFilledMode(e.target.checked)} className="rounded text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5" />
-              <span>Filled</span>
+              <span>{t('filled')}</span>
             </label>
           </nav>
         </div>
@@ -1568,28 +2266,45 @@ export default function App() {
                 setSelectedEntityIds([]);
               }}
               className={cn(
-                "px-3 py-1.5 rounded text-xs font-bold transition-all shadow-sm border uppercase tracking-wider",
+                "px-3 py-1.5 rounded text-sm font-bold transition-all shadow-sm border uppercase tracking-wider",
                 testReadOnlyMode 
                   ? "bg-rose-600 text-white border-rose-700 hover:bg-rose-700 font-black animate-pulse"
                   : "bg-white text-slate-700 border-slate-200 hover:border-slate-300"
               )}
             >
-              {testReadOnlyMode ? "🛑 Stop Testing Submitted" : "🔬 Test Submitted State"}
+              {testReadOnlyMode ? `🛑 ${t('stopTesting')}` : `🔬 ${t('testSubmitted')}`}
             </button>
           )}
 
-          {isStackEnvironment ? (
-            <div className="hidden md:flex items-center space-x-2 px-3 py-1 bg-green-50 border border-green-100 rounded-full select-none">
-               <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-               <span className="text-[10px] font-bold text-green-700 uppercase tracking-wide">STACK Linked</span>
+          {/* Removed STACK connected badges */}
+          <div className="flex flex-col items-end justify-center select-none mr-2">
+            <div className="flex items-center gap-1">
+              <svg width="32" height="32" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                 <path d="M 50,15 C 30,15 20,25 15,40 C 13,50 15,65 20,75 C 25,85 35,90 50,90 Z" fill="#eb485c" />
+                 <circle cx="20" cy="40" r="8" fill="#eb485c" />
+                 <circle cx="16" cy="55" r="9" fill="#eb485c" />
+                 <circle cx="22" cy="70" r="8" fill="#eb485c" />
+                 <circle cx="35" cy="85" r="8" fill="#eb485c" />
+                 <circle cx="35" cy="22" r="8" fill="#eb485c" />
+                 
+                 <path d="M 50,15 C 70,15 80,25 85,40 C 87,50 85,65 80,75 C 75,85 65,90 50,90 Z" fill="#fde6e8" />
+                 <circle cx="80" cy="40" r="8" fill="#fde6e8" />
+                 <circle cx="84" cy="55" r="9" fill="#fde6e8" />
+                 <circle cx="78" cy="70" r="8" fill="#fde6e8" />
+                 <circle cx="65" cy="85" r="8" fill="#fde6e8" />
+                 <circle cx="65" cy="22" r="8" fill="#fde6e8" />
+
+                 <path d="M 50,30 Q 65,25 75,35 Q 85,45 65,55" fill="none" stroke="#62bc5d" strokeWidth="4" strokeLinecap="round" />
+                 <path d="M 50,50 Q 60,60 70,55 Q 80,50 75,65 Q 70,75 55,75" fill="none" stroke="#62bc5d" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+                 <path d="M 50,70 Q 60,85 70,80" fill="none" stroke="#62bc5d" strokeWidth="4" strokeLinecap="round" />
+                 
+                 <path d="M 50,15 L 50,90" fill="none" stroke="#eb485c" strokeWidth="2" />
+
+                 <path d="M 50,15 C 40,0 20,-5 10,5 C 20,15 35,25 50,15 Z" fill="#62bc5d" />
+              </svg>
+              <span className="font-extrabold text-[#62bc5d] tracking-tighter" style={{ fontSize: '28px', fontFamily: 'Arial, sans-serif' }}>PeTeL</span>
             </div>
-          ) : null}
-          <div className="text-right hidden sm:block select-none">
-            <p className="text-xs font-bold text-slate-700">{(isInstructor || !isStackEnvironment) ? "Dr. Julian Sterling" : "Student Account"}</p>
-            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-semibold">{(isInstructor || !isStackEnvironment) ? "Chemistry 101 Section B" : "Interactive assignment"}</p>
-          </div>
-          <div className="w-9 h-9 bg-slate-100 rounded-full flex items-center justify-center border-2 border-white shadow-md ring-1 ring-slate-100 group cursor-pointer hover:ring-indigo-200 transition-all select-none">
-            <span className="text-xs font-bold text-slate-600 group-hover:text-indigo-600">{(isInstructor || !isStackEnvironment) ? "JS" : "ST"}</span>
+            <span className="text-[11px] font-black text-[#5ba157] uppercase tracking-widest mt-0.5">CHEMISTRY</span>
           </div>
         </div>
       </header>
@@ -1597,25 +2312,70 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         {/* Left Toolbar - Sidebar Palette */}
         {(!isReadOnly && !testReadOnlyMode) ? (
-          <aside className="w-20 bg-white border-r border-slate-200 flex flex-col items-center py-4 space-y-4 shadow-[1px_0_4px_rgba(0,0,0,0.02)] z-10 shrink-0 overflow-y-auto overflow-x-hidden">
-            <ToolPaletteButton 
-              active={mode === 'select'} 
-              onClick={() => setMode('select')}
-              icon={<MousePointer2 className="w-5 h-5" />}
-              label="Select"
-            />
-            <div className="w-8 h-px bg-slate-100 my-2" />
+          <aside className="w-28 bg-white border-r border-slate-200 flex flex-col items-center py-4 space-y-4 shadow-[1px_0_4px_rgba(0,0,0,0.02)] z-10 shrink-0 overflow-y-auto overflow-x-hidden">
+            <div className="grid grid-cols-2 gap-2 px-2 w-full place-items-center">
+              <ToolPaletteButton 
+                active={mode === 'select'} 
+                onClick={() => setMode('select')}
+                icon={<MousePointer2 className="w-6 h-6" />}
+                label={t('select')}
+              />
+              <ToolPaletteButton 
+                active={mode === 'erase'} 
+                onClick={() => {
+                  if (selectedEntityIds.length > 0) {
+                    const newAtoms = atoms.filter(a => !selectedEntityIds.includes(a.id));
+                    const newBonds = bonds.filter(b => 
+                      !selectedEntityIds.includes(b.id) && 
+                      !selectedEntityIds.includes(b.atom1Id) && 
+                      !selectedEntityIds.includes(b.atom2Id)
+                    );
+                    updateState(newAtoms, newBonds);
+                    setSelectedEntityIds([]);
+                  } else {
+                    setMode('erase');
+                  }
+                }}
+                icon={<Trash2 className="w-6 h-6" />}
+                label={t('erase')}
+                variant="danger"
+              />
+            </div>
             
-            <ToolPaletteButton 
-              active={mode === 'atom'} 
-              onClick={() => { setMode('atom'); }}
-              icon={<Plus className="w-5 h-5" />}
-              label="Atom"
-            />
+            <div className="w-16 h-px bg-slate-100 my-1" />
+            
+            <div className="grid grid-cols-2 gap-2 px-2 w-full place-items-center">
+              <ToolPaletteButton 
+                active={mode === 'atom'} 
+                onClick={() => { setMode('atom'); }}
+                icon={<Plus className="w-6 h-6" />}
+                label={t('atom')}
+              />
+              <ToolPaletteButton 
+                active={mode === 'bond'} 
+                onClick={() => setMode('bond')}
+                icon={<Minus className="w-6 h-6" />}
+                label={t('bond')}
+              />
+              <ToolPaletteButton 
+                active={mode === 'chain'} 
+                onClick={() => setMode('chain')}
+                icon={<Activity className="w-6 h-6" />}
+                label={t('chain')}
+              />
+              <ToolPaletteButton 
+                active={mode === 'lone-pair'} 
+                onClick={() => setMode('lone-pair')}
+                icon={<CircleDot className="w-6 h-6" />}
+                label="e⁻"
+              />
+            </div>
+
+            <div className="w-16 h-px bg-slate-100 my-1" />
             
             {/* Elements Quick Access */}
-            <div className="flex flex-col gap-1 w-full px-2">
-              {['C', 'H', 'O', 'N', 'P', 'S', 'F', 'Cl', 'Br', 'I'].map(el => (
+            <div className="grid grid-cols-2 gap-1 w-full px-2">
+              {['C', 'H', 'N', 'O', 'P', 'S', 'F', 'Cl', 'Br', 'I'].map(el => (
                 <button
                   key={el}
                   onClick={() => {
@@ -1626,7 +2386,7 @@ export default function App() {
                     "w-full h-8 flex items-center justify-center rounded font-bold text-sm transition-all",
                     selectedElement === el && mode === 'atom'
                       ? "bg-indigo-600 text-white shadow-lg mx-0"
-                      : "text-slate-400 hover:bg-slate-50 hover:text-slate-600 mx-1 w-auto"
+                      : "bg-slate-50 text-slate-400 hover:bg-slate-100 hover:text-slate-600 w-auto"
                   )}
                 >
                   {el}
@@ -1638,69 +2398,31 @@ export default function App() {
                 }}
                 title="Other element"
                 className={cn(
-                  "w-full h-8 flex items-center justify-center rounded font-bold text-xs transition-all",
-                  !['C', 'H', 'O', 'N', 'P', 'S', 'F', 'Cl', 'Br', 'I'].includes(selectedElement) && mode === 'atom'
+                  "col-span-2 w-full h-8 flex items-center justify-center rounded font-bold text-sm transition-all mt-1",
+                  !['C', 'H', 'N', 'O', 'P', 'S', 'F', 'Cl', 'Br', 'I'].includes(selectedElement) && mode === 'atom'
                     ? "bg-indigo-600 text-white shadow-lg mx-0"
-                    : "text-slate-400 hover:bg-slate-50 hover:text-slate-600 mx-1 w-auto"
+                    : "bg-slate-50 text-slate-400 hover:bg-slate-100 hover:text-slate-600 w-auto"
                 )}
               >
                 {['C', 'H', 'O', 'N', 'P', 'S', 'F', 'Cl', 'Br', 'I'].includes(selectedElement) ? '...' : selectedElement}
               </button>
             </div>
 
-            <div className="w-8 h-px bg-slate-100 my-2" />
+            <div className="w-16 h-px bg-slate-100 my-1" />
             
-            <ToolPaletteButton 
-              active={mode === 'bond'} 
-              onClick={() => setMode('bond')}
-              icon={<Minus className="w-5 h-5" />}
-              label="Bond"
-            />
-            
-            <ToolPaletteButton 
-              active={mode === 'lone-pair'} 
-              onClick={() => setMode('lone-pair')}
-              icon={<CircleDot className="w-5 h-5" />}
-              label="L-Pairs"
-            />
-            
-            <div className="w-8 h-px bg-slate-100 my-2" />
-
-            <ToolPaletteButton 
-              active={mode === 'erase'} 
-              onClick={() => {
-                if (selectedEntityIds.length > 0) {
-                  const newAtoms = atoms.filter(a => !selectedEntityIds.includes(a.id));
-                  const newBonds = bonds.filter(b => 
-                    !selectedEntityIds.includes(b.id) && 
-                    !selectedEntityIds.includes(b.atom1Id) && 
-                    !selectedEntityIds.includes(b.atom2Id)
-                  );
-                  updateState(newAtoms, newBonds);
-                  setSelectedEntityIds([]);
-                } else {
-                  setMode('erase');
-                }
-              }}
-              icon={<Trash2 className="w-5 h-5" />}
-              label="Erase"
-              variant="danger"
-            />
-
-            <div className="flex-1" />
             <button 
               onClick={() => { updateState([], []); setSelectedEntityIds([]); }}
-              className="w-14 h-14 bg-rose-50 hover:bg-rose-100 border border-rose-150 text-rose-500 rounded-xl font-bold text-[9px] uppercase tracking-tighter shadow-sm transition-all flex flex-col items-center justify-center gap-1 shrink-0"
+              className="w-20 h-10 bg-rose-50 hover:bg-rose-100 border border-rose-150 text-rose-500 rounded-xl font-bold text-xs uppercase tracking-tighter shadow-sm transition-all flex items-center justify-center gap-1 shrink-0 mt-2"
               title="Clear entire canvas drawing"
             >
-              <RotateCcw className="w-4 h-4" />
-              Clear
+              <RotateCcw className="w-3.5 h-3.5" />
+              {t('clear')}
             </button>
           </aside>
         ) : (
           /* Locked Read Only display: simple static reference column */
           <aside className="w-20 bg-slate-50 border-r border-slate-200 flex flex-col items-center py-6 space-y-4 shadow-[1px_0_4px_rgba(0,0,0,0.01)] z-10 shrink-0 select-none">
-            <span className="text-[10px] uppercase font-black tracking-widest text-slate-400 rotate-270 whitespace-nowrap mt-4 inline-block font-mono">
+            <span className="text-base uppercase font-black tracking-widest text-slate-400 rotate-270 whitespace-nowrap mt-4 inline-block font-mono">
               LOCKED
             </span>
           </aside>
@@ -1714,10 +2436,6 @@ export default function App() {
               className="w-full h-full touch-none"
               onPointerDown={handleSvgPointerDown}
               onPointerUp={handleSvgPointerUp}
-              onWheel={(e) => {
-                const zoomSensitivity = 0.001;
-                setScale(prev => Math.max(0.1, Math.min(prev - e.deltaY * zoomSensitivity, 5)));
-              }}
             >
               <g ref={gRef} transform={`scale(${scale})`}>
               {selectionBoxStart && selectionBoxCurrent && mode === 'select' && (
@@ -1754,7 +2472,7 @@ export default function App() {
               })}
 
               {/* Dragging Preview */}
-              {dragStartAtom && (
+              {dragStartAtom && mode !== 'chain' && (
                 <line
                   x1={atoms.find(a => a.id === dragStartAtom)?.x}
                   y1={atoms.find(a => a.id === dragStartAtom)?.y}
@@ -1764,6 +2482,27 @@ export default function App() {
                   strokeDasharray="6 4"
                 />
               )}
+              {dragStartAtom && mode === 'chain' && (
+                <g className="pointer-events-none">
+                  {(() => {
+                    const startA = atoms.find(a => a.id === dragStartAtom);
+                    if (!startA) return null;
+                    const pts = getChainPreview(startA.x, startA.y, mousePos.x, mousePos.y);
+                    if (pts.length < 2) return null;
+                    return pts.slice(0, -1).map((pt, i) => (
+                      <line
+                        key={`chain-${i}`}
+                        x1={pt.x}
+                        y1={pt.y}
+                        x2={pts[i+1].x}
+                        y2={pts[i+1].y}
+                        className="stroke-indigo-400 stroke-[3] opacity-70"
+                        strokeDasharray="6 4"
+                      />
+                    ));
+                  })()}
+                </g>
+              )}
 
               {/* Render Atoms */}
               {visibleAtoms.map(atom => (
@@ -1771,7 +2510,6 @@ export default function App() {
                   key={atom.id}
                   atom={atom}
                   onPointerDown={(e) => handleAtomPointerDown(e, atom.id)}
-                  onPointerUp={(e) => handleAtomPointerUp(e, atom.id)}
                   isEraser={mode === 'erase'}
                   isSelected={selectedEntityIds.includes(atom.id)}
                   currentValency={getAtomValency(atom.id)}
@@ -1782,122 +2520,75 @@ export default function App() {
                   skeletalMode={skeletalMode}
                   hideImplicitHydrogens={hideImplicitHydrogens}
                   filledMode={filledMode}
+                  showValencyWarnings={showValencyWarnings}
                 />
+              ))}
+
+              {/* Status for individual molecules if grading is active */}
+              {(isReadOnly || testReadOnlyMode) && componentMatchResults.map((res, i) => (
+                 res.molecule.atoms.length > 0 && (
+                   <g key={`status-${i}`} transform={`translate(${res.cx}, ${res.cy})`} className="pointer-events-none">
+                     <circle r="16" fill={res.isMatch ? "#10b981" : "#ef4444"} className="drop-shadow-md" />
+                     {res.isMatch ? (
+                       <path d="M -6 0 L -2 4 L 6 -4" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                     ) : (
+                       <path d="M -4 -4 L 4 4 M -4 4 L 4 -4" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                     )}
+                   </g>
+                 )
               ))}
               </g>
             </svg>
 
-            {/* Canvas Overlay Controls */}
-            <div className="absolute bottom-4 left-4 flex space-x-2 pointer-events-none">
-              <div className="bg-white/80 backdrop-blur-sm px-3 py-1 border border-slate-200 rounded text-[10px] font-mono shadow-sm text-slate-500 font-bold uppercase tracking-wider">
-                X: {Math.round(mousePos.x)}px Y: {Math.round(mousePos.y)}px
-              </div>
-              <div className="bg-white/80 backdrop-blur-sm px-4 py-2 border border-slate-200 rounded-lg shadow-sm text-slate-400 font-bold uppercase flex items-center gap-4 pointer-events-auto">
-                <button 
-                  onPointerDown={() => setScale(s => Math.max(0.1, s - 0.1))}
-                  className="hover:text-indigo-600 transition-colors p-2 bg-slate-50 rounded"
-                >-</button>
-                <span className="text-[10px] min-w-[60px] text-center">Scale: {scale.toFixed(1)}x</span>
-                <button 
-                  onPointerDown={() => setScale(s => Math.min(5, s + 0.1))}
-                  className="hover:text-indigo-600 transition-colors p-2 bg-slate-50 rounded"
-                >+</button>
-              </div>
-            </div>
-
             {/* If Student Review OR Test Mode, render the floating report */}
             {(isReadOnly || testReadOnlyMode) && (
-              <div id="grading-report" className="absolute top-4 right-4 w-80 bg-white/95 backdrop-blur-md border border-slate-200 shadow-2xl rounded-2xl p-4 z-30 flex flex-col max-h-[85%] overflow-y-auto pointer-events-auto select-none">
+              <div id="grading-report" 
+                style={{ transform: `translate(${gradePanelOffset.x}px, ${gradePanelOffset.y}px)` }}
+                onPointerDown={(e) => {
+                  isDraggingGradeRef.current = true;
+                  dragGradeStartRef.current = { x: e.clientX, y: e.clientY };
+                  dragGradeInitialOffsetRef.current = { ...gradePanelOffset };
+                  e.stopPropagation();
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                }}
+                className="absolute top-4 right-4 w-56 bg-white/95 backdrop-blur-md border border-slate-200 shadow-2xl rounded-2xl p-4 z-30 flex flex-col pointer-events-auto select-none cursor-move">
                 {teacherAnswer ? (
                   <>
                     <div className={cn(
-                      "flex items-center space-x-2 pb-3 mb-3 border-b p-2 rounded-lg",
-                      gradeResult?.match 
+                      "flex items-center space-x-2 p-2 rounded-lg",
+                      score === 1 
                         ? "border-emerald-100 bg-emerald-50 text-emerald-800"
+                        : score && score > 0
+                        ? "border-amber-100 bg-amber-50 text-amber-800"
                         : "border-rose-100 bg-rose-50 text-rose-800"
                     )}>
-                      {gradeResult?.match ? (
+                      {score === 1 ? (
                         <>
-                          <Check className="w-5 h-5 text-emerald-600 font-bold" />
+                          <Check className="w-6 h-6 text-emerald-600 font-bold" />
                           <div className="flex-1">
-                            <h4 className="font-sans font-black text-xs tracking-wider uppercase">Submission: Correct</h4>
-                            <p className="text-[9px] opacity-75">Answer fits structural criteria</p>
+                            <h4 className="font-sans font-black text-sm tracking-wider uppercase">{t('submissionCorrect')}</h4>
                           </div>
-                          <span className="px-2 py-0.5 bg-emerald-600 text-white rounded font-mono font-black text-[9px]">100%</span>
+                          <span className="px-2 py-0.5 bg-emerald-600 text-white rounded font-mono font-black text-sm">100%</span>
                         </>
                       ) : (
                         <>
-                          <X className="w-5 h-5 text-rose-600 font-bold" />
+                          {score === 0 && <X className="w-6 h-6 text-rose-600 font-bold" />}
                           <div className="flex-1">
-                            <h4 className="font-sans font-black text-xs tracking-wider uppercase">Submission: Incorrect</h4>
-                            <p className="text-[9px] opacity-75 font-bold animate-pulse">Unmatched structure</p>
+                            <h4 className="font-sans font-black text-sm tracking-wider uppercase">{t('submissionIncorrect')}</h4>
                           </div>
-                          <span className="px-2 py-0.5 bg-rose-600 text-white rounded font-mono font-black text-[9px]">0%</span>
+                          <span className={cn("px-2 py-0.5 text-white rounded font-mono font-black text-sm", score && score > 0 ? "bg-amber-500" : "bg-rose-600")}>
+                            {Math.round((score || 0) * 100)}%
+                          </span>
                         </>
                       )}
                     </div>
-
-                    <div className="text-xs text-slate-600 mb-4 bg-slate-50 p-2.5 rounded border border-slate-100 leading-relaxed font-semibold">
-                      {gradeResult?.message}
-                    </div>
-
-                    {/* Stats metrics */}
-                    <div className="grid grid-cols-2 gap-2 mb-4">
-                      <div className="p-2 border border-slate-100 bg-slate-50/50 rounded text-center">
-                        <p className="text-[9px] text-slate-400 uppercase font-bold tracking-wider">Atoms count</p>
-                        <p className={cn(
-                          "text-sm font-black",
-                          atoms.length === teacherAnswer.atoms.length ? "text-emerald-600" : "text-rose-600"
-                        )}>{atoms.length} <span className="text-xs font-medium text-slate-400">/ {teacherAnswer.atoms.length}</span></p>
-                      </div>
-                      <div className="p-2 border border-slate-100 bg-slate-50/50 rounded text-center">
-                        <p className="text-[9px] text-slate-400 uppercase font-bold tracking-wider">Bonds count</p>
-                        <p className={cn(
-                          "text-sm font-black",
-                          bonds.length === teacherAnswer.bonds.length ? "text-emerald-600" : "text-rose-600"
-                        )}>{bonds.length} <span className="text-xs font-medium text-slate-400">/ {teacherAnswer.bonds.length}</span></p>
-                      </div>
-                    </div>
-
-                    {/* Element counts */}
-                    <div className="mb-2">
-                      <p className="text-[9px] text-slate-400 uppercase font-extrabold tracking-wider mb-2">Composition Analysis</p>
-                      <div className="border border-slate-100 rounded-lg overflow-hidden text-xs">
-                        <table className="w-full text-left border-collapse">
-                          <thead>
-                            <tr className="bg-slate-50 text-[10px] text-slate-500 uppercase font-bold border-b border-slate-100">
-                              <th className="py-1 px-2.5">Element</th>
-                              <th className="py-1 px-2 text-center font-bold">Drawn</th>
-                              <th className="py-1 px-2 text-center font-bold">Correct</th>
-                              <th className="py-1 px-2.5 text-right font-bold">Status</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {elementComparison?.map(item => (
-                              <tr key={item.symbol} className="border-b border-slate-50 hover:bg-slate-50/40">
-                                <td className="py-1.5 px-2.5 font-bold text-slate-700">{item.symbol}</td>
-                                <td className="py-1.5 px-2 text-center font-semibold text-slate-600">{item.drawn}</td>
-                                <td className="py-1.5 px-2 text-center font-semibold text-slate-600">{item.expected}</td>
-                                <td className="py-1.5 px-2.5 text-right font-medium">
-                                  {item.matched ? (
-                                    <span className="text-emerald-600 text-[10px]">Matched</span>
-                                  ) : (
-                                    <span className="text-rose-500 text-[10px] font-bold">Mismatch</span>
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
                   </>
                 ) : (
-                  <div className="p-2 text-xs text-amber-800 flex flex-col items-center gap-2">
-                    <AlertCircle className="w-8 h-8 text-amber-500 animate-bounce" />
-                    <p className="font-bold text-center">No Teacher Answer Key Parameters Loaded</p>
-                    <p className="text-[10px] text-amber-600 text-center leading-normal">
-                      The instructor has not submitted a correct answer code `TA` for evaluation yet.
+                  <div className="p-2 text-sm text-amber-800 flex flex-col items-center gap-2">
+                    <AlertCircle className="w-10 h-10 text-amber-500 animate-bounce" />
+                    <p className="font-bold text-center">{t('noAnswerKey')}</p>
+                    <p className="text-base text-amber-600 text-center leading-normal">
+                      {t('noAnswerSubtext')}
                     </p>
                   </div>
                 )}
@@ -1906,50 +2597,69 @@ export default function App() {
           </div>
 
           {/* Status Bar */}
-          <footer className="h-8 bg-slate-50 border-t border-slate-200 flex items-center px-4 justify-between shrink-0 shadow-[0_-1px_2px_rgba(0,0,0,0.02)]">
-            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest italic shrink-0">
-              {atoms.length === 0 ? "Empty Canvas" : "Structure Modified - Ready for Export"}
-            </p>
-            <div className="flex space-x-6 items-center overflow-hidden">
-              <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-tighter shrink-0 flex items-center gap-1">
-                <span className="w-1.5 h-1.5 bg-slate-300 rounded-full" /> Atoms: {atoms.length}
+          <footer className="h-10 bg-slate-50 border-t border-slate-200 flex items-center px-4 justify-between shrink-0 shadow-[0_-1px_2px_rgba(0,0,0,0.02)]">
+            <div className="flex items-center space-x-2">
+              <div className="bg-white px-2 py-1 border border-slate-200 rounded text-[11px] font-mono shadow-sm text-slate-500 font-bold uppercase tracking-wider">
+                X: {Math.round(mousePos.x)} Y: {Math.round(mousePos.y)}
+              </div>
+              <div className="bg-white px-2 py-1 border border-slate-200 rounded shadow-sm text-slate-500 font-bold uppercase flex items-center gap-1.5 pointer-events-auto">
+                <button 
+                  onPointerDown={() => setScale(s => Math.max(0.1, s - 0.1))}
+                  className="hover:text-indigo-600 transition-colors bg-slate-50 rounded h-5 w-5 flex items-center justify-center border border-slate-200"
+                >-</button>
+                <span className="text-[11px] min-w-[50px] text-center font-mono">{t('scale')}: {scale.toFixed(1)}x</span>
+                <button 
+                  onPointerDown={() => setScale(s => Math.min(5, s + 0.1))}
+                  className="hover:text-indigo-600 transition-colors bg-slate-50 rounded h-5 w-5 flex items-center justify-center border border-slate-200"
+                >+</button>
+              </div>
+            </div>
+            <div className="flex space-x-4 items-center overflow-hidden">
+              <span className="text-base font-extrabold text-slate-400 uppercase tracking-tighter shrink-0 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 bg-slate-300 rounded-full" /> {t('atoms')}: {atoms.length}
               </span>
-              <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-tighter shrink-0 flex items-center gap-1">
-                <span className="w-1.5 h-1.5 bg-slate-300 rounded-full" /> Bonds: {bonds.length}
+              <span className="text-base font-extrabold text-slate-400 uppercase tracking-tighter shrink-0 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 bg-slate-300 rounded-full" /> {t('bonds')}: {bonds.length}
               </span>
-              {isStackEnvironment && (
-                <span className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-tighter shrink-0 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 bg-indigo-300 rounded-full" /> STACK: Connected
-                </span>
-              )}
             </div>
           </footer>
         </main>
 
         {/* Inspector Sidebar */}
-        {!isStudentMode && !testReadOnlyMode && (
-          <aside className="w-72 bg-slate-50 border-l border-slate-200 flex flex-col overflow-hidden shadow-inner shrink-0">
+        {!testReadOnlyMode && (
+          <aside className="w-56 bg-slate-50 border-l border-slate-200 flex flex-col overflow-hidden shadow-inner shrink-0">
+          {!isStudentMode && (
+          <div className="p-3 border-b border-indigo-200 bg-indigo-50/50">
+             <button 
+                onClick={copyToClipboard}
+                className="w-full bg-indigo-600 hover:bg-indigo-700 active:scale-[0.98] py-2.5 rounded-lg text-white text-xs font-bold tracking-widest uppercase transition-all shadow-md"
+              >
+                {copied ? t('syncedToQuestion') : t('publishAnswerKey')}
+              </button>
+          </div>
+          )}
+          <div className="flex-1 overflow-y-auto custom-scrollbar">
           <div className="p-4 border-b border-slate-200 bg-white">
-            <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">Entity Properties</h3>
+            <h3 className="text-base font-bold text-slate-400 uppercase tracking-widest mb-4">{t('entityProperties')}</h3>
             
             {selectedEntityIds.length > 0 ? (
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg shadow-sm">
                 <div className="flex justify-between items-center mb-4">
-                  <span className="text-xs font-bold text-slate-700">
-                    {selectedEntityIds.length > 1 ? `${selectedEntityIds.length} Entities Selected` : selectedAtom ? `Element: ${selectedAtom.symbol}` : `Bond: ${selectedBond?.order === 0 ? 'H-Bond' : selectedBond?.order === 1 ? 'Single' : selectedBond?.order === 2 ? 'Double' : 'Triple'}`}
+                  <span className="text-sm font-bold text-slate-700">
+                    {selectedEntityIds.length > 1 ? `${selectedEntityIds.length} ${t('entitiesSelected')}` : selectedAtom ? `${t('elementLabel')}: ${selectedAtom.symbol}` : `${t('bondLabel')}: ${selectedBond?.order === 0 ? 'H-Bond' : selectedBond?.order === 1 ? 'Single' : selectedBond?.order === 2 ? 'Double' : 'Triple'}`}
                   </span>
-                  <span className="text-[10px] px-2 py-0.5 bg-slate-200 text-slate-600 rounded-full font-mono font-bold">
+                  <span className="text-base px-2 py-0.5 bg-slate-200 text-slate-600 rounded-full font-mono font-bold">
                     ID: {selectedEntityIds.length === 1 ? selectedEntityIds[0].slice(0, 4) : 'MULT'}
                   </span>
                 </div>
 
                 <div className="mb-4 space-y-1">
                   <div className="flex gap-1 flex-wrap items-center">
-                    <button onClick={() => reflectSelection('horizontal')} className="px-2 py-1 text-[9px] font-bold rounded border bg-white text-slate-500 border-slate-200 hover:border-slate-300 transition-all flex-1">Reflect H</button>
-                    <button onClick={() => reflectSelection('vertical')} className="px-2 py-1 text-[9px] font-bold rounded border bg-white text-slate-500 border-slate-200 hover:border-slate-300 transition-all flex-1">Reflect V</button>
+                    <button onClick={() => reflectSelection('horizontal')} className="px-2 py-1 text-sm font-bold rounded border bg-white text-slate-500 border-slate-200 hover:border-slate-300 transition-all flex-1">{t('reflectH')}</button>
+                    <button onClick={() => reflectSelection('vertical')} className="px-2 py-1 text-sm font-bold rounded border bg-white text-slate-500 border-slate-200 hover:border-slate-300 transition-all flex-1">{t('reflectV')}</button>
                   </div>
                   <div className="mt-3">
-                    <label className="text-[9px] text-slate-400 uppercase font-black tracking-tight mb-1 block">Rotate Freely</label>
+                    <label className="text-sm text-slate-400 uppercase font-black tracking-tight mb-1 block">{t('rotateFreely')}</label>
                     <input 
                       type="range" 
                       min="-180" 
@@ -1979,31 +2689,16 @@ export default function App() {
                 </div>
                 
                 {selectedAtom && (
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-3">
                     <div className="space-y-1">
-                      <label className="text-[9px] text-slate-400 uppercase font-black tracking-tight">Hybridization</label>
-                      <div className="text-xs font-bold text-slate-600 bg-white border border-slate-200 rounded px-2 py-1.5 shadow-sm">sp³</div>
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-[9px] text-slate-400 uppercase font-black tracking-tight">Charge</label>
-                      <button 
-                        onClick={() => {
-                          updateState(atoms.map(a => selectedEntityIds.includes(a.id) ? { ...a, charge: a.charge === 0 ? 1 : a.charge === 1 ? -1 : 0 } : a), bonds)
-                        }}
-                        className="w-full text-left text-xs font-bold text-slate-600 bg-white border border-slate-200 rounded px-2 py-1.5 shadow-sm hover:border-indigo-300 transition-colors"
-                      >
-                        {selectedAtom.charge > 0 ? "+1" : selectedAtom.charge < 0 ? "-1" : "0"}
-                      </button>
-                    </div>
-                    <div className="space-y-1 col-span-2">
-                       <label className="text-[9px] text-slate-400 uppercase font-black tracking-tight">Swap Element</label>
+                       <label className="text-sm text-slate-400 uppercase font-black tracking-tight">{t('swapElement')}</label>
                        <div className="flex flex-wrap gap-1">
                           {TOOLBAR_ELEMENTS.map(el => (
                             <button
                               key={el}
                               onClick={() => updateState(atoms.map(a => selectedEntityIds.includes(a.id) ? { ...a, symbol: el } : a), bonds)}
                               className={cn(
-                                "px-2 py-1 text-[10px] font-bold rounded border transition-all flex-1 text-center min-w-[24px]",
+                                "px-2 py-1 text-base font-bold rounded border transition-all flex-1 text-center min-w-[32px]",
                                 selectedAtom.symbol === el ? "bg-indigo-600 text-white border-indigo-700 shadow-sm" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"
                               )}
                             >
@@ -2018,18 +2713,19 @@ export default function App() {
                 {selectedBond && (
                    <div className="space-y-3">
                       <div className="space-y-1">
-                        <label className="text-[9px] text-slate-400 uppercase font-black tracking-tight">Order</label>
-                        <div className="flex gap-1">
-                          {[0, 1, 2, 3].map(o => (
+                        <label className="text-sm text-slate-400 uppercase font-black tracking-tight">{t('order')}</label>
+                        <div className="flex gap-1.5 h-10">
+                          {[0, 1, 2, 3, 4, 5].map(o => (
                             <button
                               key={o}
-                              onClick={() => updateState(atoms, bonds.map(b => selectedEntityIds.includes(b.id) ? { ...b, order: o as 0|1|2|3 } : b))}
+                              onClick={() => updateState(atoms, bonds.map(b => selectedEntityIds.includes(b.id) ? { ...b, order: o } : b))}
                               className={cn(
-                                "flex-1 py-1 text-[10px] font-bold rounded border transition-all",
-                                selectedBond.order === o ? "bg-indigo-600 text-white border-indigo-700 shadow-sm" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"
+                                "flex-1 py-1 text-sm font-black rounded border transition-all flex items-center justify-center",
+                                selectedBond.order === o ? "bg-indigo-600 text-white border-indigo-700 shadow-inner" : "bg-white text-slate-600 border-slate-200 hover:border-slate-300 hover:bg-slate-50"
                               )}
+                              title={o === 0 ? 'Hydrogen Bond' : o === 1 ? 'Single' : o === 2 ? 'Double' : o === 3 ? 'Triple' : o === 4 ? 'Wedge' : 'Dash'}
                             >
-                              {o === 0 ? 'H-Bond' : o === 1 ? 'Single' : o === 2 ? 'Double' : 'Triple'}
+                              {o === 0 ? 'H' : o === 1 ? '-' : o === 2 ? '=' : o === 3 ? '≡' : o === 4 ? '▲' : '▤'}
                             </button>
                           ))}
                         </div>
@@ -2039,35 +2735,16 @@ export default function App() {
               </div>
             ) : (
               <div className="p-6 bg-slate-50/50 border border-dashed border-slate-200 rounded-lg flex flex-col items-center justify-center text-center">
-                <MousePointer2 className="w-8 h-8 text-slate-200 mb-2" />
-                <p className="text-[10px] font-bold uppercase text-slate-300 tracking-widest">Select entity to inspect</p>
+                <MousePointer2 className="w-10 h-10 text-slate-200 mb-2" />
+                <p className="text-base font-bold uppercase text-slate-300 tracking-widest">{t('selectToInspect')}</p>
               </div>
             )}
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-            <div className="mt-8">
-              <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">STACK Verification</h3>
-              <div className="bg-indigo-900 rounded-xl p-4 text-white shadow-lg overflow-hidden relative">
-                <div className="absolute top-0 right-0 w-24 h-24 bg-indigo-500/10 rounded-full -mr-12 -mt-12" />
-                <p className="text-[9px] font-black text-indigo-200 uppercase mb-3 tracking-widest flex items-center gap-2">
-                  <Check className="w-3 h-3" /> Output JSON for Moodle
-                </p>
-                <div className="bg-black/30 rounded-lg p-3 text-[10px] font-mono whitespace-pre text-indigo-100 overflow-x-auto max-h-48 custom-scrollbar border border-white/5">
-                  {exportData}
-                </div>
-                <button 
-                  onClick={copyToClipboard}
-                  className="w-full mt-4 bg-indigo-500 hover:bg-indigo-400 active:scale-[0.98] py-2.5 rounded-lg text-[10px] font-bold tracking-widest uppercase transition-all shadow-md"
-                >
-                  {copied ? 'Synced to Question' : 'Publish Answer Key'}
-                </button>
-              </div>
-            </div>
-          </div>
 
+          {!isStudentMode && (
           <div className="p-4 border-t border-slate-200 bg-white">
-            <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Saved Gallery</h3>
+            <h3 className="text-base font-bold text-slate-400 uppercase tracking-widest mb-2">{t('savedGallery')}</h3>
             
             <div className="flex items-center gap-2 mb-3">
               <input 
@@ -2075,33 +2752,33 @@ export default function App() {
                   id="strictMatch" 
                   checked={strictMatching} 
                   onChange={(e) => setStrictMatching(e.target.checked)}
-                  className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 w-3 h-3"
+                  className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 w-6 h-6"
               />
-              <label htmlFor="strictMatch" className="text-[10px] font-bold text-slate-500 cursor-pointer">
-                  Strict Match Drawn H&#39;s
+              <label htmlFor="strictMatch" className="text-base font-bold text-slate-500 cursor-pointer">
+                  {t('strictMatch')}
               </label>
             </div>
 
             <div className="space-y-2 mb-4 max-h-40 overflow-y-auto custom-scrollbar">
-              {savedMolecules.length === 0 && <p className="text-[10px] text-slate-300 italic text-center">No saved structures</p>}
+              {savedMolecules.length === 0 && <p className="text-base text-slate-300 italic text-center">{t('noSavedStructures')}</p>}
               {savedMolecules.map(m => (
                 <div key={m.id} className="flex gap-1">
                   <button
                     onClick={() => loadMolecule(m.data)}
-                    className="flex-1 text-left p-2 bg-slate-50 border border-slate-200 rounded text-[10px] font-bold text-slate-600 hover:bg-slate-100 transition-colors flex justify-between"
+                    className="flex-1 text-left p-2 bg-slate-50 border border-slate-200 rounded text-base font-bold text-slate-600 hover:bg-slate-100 transition-colors flex justify-between"
                   >
                     <span>{m.name}</span>
-                    <span className="text-slate-400 font-mono italic">{m.data.atoms.length} At</span>
+                    <span className="text-slate-400 font-mono italic">{m.data.atoms.length} {t('atoms')}</span>
                   </button>
                   <button 
                     onClick={() => {
                         const result = areMoleculesEqual({atoms, bonds}, m.data, strictMatching);
                         alert(result.message);
                     }}
-                    className="px-2 bg-indigo-50 border border-indigo-200 text-indigo-600 hover:bg-indigo-100 rounded text-[10px] font-bold transition-all"
-                    title="Compare with Drawn"
+                    className="px-2 bg-indigo-50 border border-indigo-200 text-indigo-600 hover:bg-indigo-100 rounded text-base font-bold transition-all"
+                    title={t('compare')}
                   >
-                    Compare
+                    {t('compare')}
                   </button>
                 </div>
               ))}
@@ -2110,33 +2787,30 @@ export default function App() {
             <div className="flex flex-col gap-2 mb-4">
               <button 
                 onClick={saveMolecule}
-                className="w-full bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white px-4 py-2.5 rounded-lg font-bold text-[10px] uppercase tracking-widest shadow-md shadow-emerald-100 transition-all"
+                className="w-full bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white px-3 py-1.5 rounded font-bold text-sm uppercase tracking-widest shadow-sm transition-all"
               >
-                Save Structure
-              </button>
-              <button 
-                onClick={() => { updateState([], []); setSelectedEntityIds([]); }}
-                className="w-full bg-white hover:bg-red-50 border border-slate-200 text-red-500 active:scale-[0.98] px-4 py-2.5 rounded-lg font-bold text-[10px] uppercase tracking-widest shadow-sm transition-all flex items-center justify-center gap-2"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                Clear All
+                {t('saveStructureBtn')}
               </button>
             </div>
             <button 
               onClick={exportImage}
-              className="w-full bg-indigo-600 hover:bg-indigo-700 active:scale-[0.98] text-white px-4 py-2.5 rounded-lg font-bold text-[10px] uppercase tracking-widest shadow-md shadow-indigo-100 transition-all"
+              className="w-full bg-indigo-600 hover:bg-indigo-700 active:scale-[0.98] text-white px-3 py-1.5 rounded font-bold text-sm uppercase tracking-widest shadow-sm transition-all mb-4"
             >
-              Export as PNG
+              {t('exportPng')}
             </button>
           </div>
+          )}
+          {!isStudentMode && (
           <div className="p-4 border-t border-slate-200 bg-white">
             <a 
               href="/molecule-editor.html"
               download="molecule-editor.html"
-              className="w-full flex items-center justify-center bg-slate-800 hover:bg-slate-900 text-white px-4 py-2.5 rounded-lg font-bold text-[10px] uppercase tracking-widest shadow-md transition-all"
+              className="w-full flex items-center justify-center bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded font-bold text-sm uppercase tracking-widest shadow-sm transition-all"
             >
-              📥 Download App HTML
+              📥 {t('downloadHtml')}
             </a>
+          </div>
+          )}
           </div>
         </aside>
         )}
@@ -2146,7 +2820,7 @@ export default function App() {
       {showSavePrompt && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
           <div className="bg-white p-6 rounded-xl shadow-2xl w-80 max-w-full">
-            <h3 className="font-bold text-slate-800 text-sm mb-4">Save Structure</h3>
+            <h3 className="font-bold text-slate-800 text-sm mb-4">{t('saveTitle')}</h3>
             <input 
               autoFocus
               type="text" 
@@ -2157,11 +2831,11 @@ export default function App() {
                 if (e.key === 'Escape') setShowSavePrompt(false); 
               }}
               className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-4"
-              placeholder="Structure Name"
+              placeholder={t('saveTitle')}
             />
-            <div className="flex justify-end gap-2 text-xs font-bold font-sans">
-              <button onClick={() => setShowSavePrompt(false)} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded">CANCEL</button>
-              <button onClick={executeSaveMolecule} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded">SAVE</button>
+            <div className="flex justify-end gap-2 text-sm font-bold font-sans">
+              <button onClick={() => setShowSavePrompt(false)} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded">{t('cancelBtn')}</button>
+              <button onClick={executeSaveMolecule} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded">{t('saveBtn')}</button>
             </div>
           </div>
         </div>
@@ -2171,7 +2845,7 @@ export default function App() {
       {showElementPrompt && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
           <div className="bg-white p-6 rounded-xl shadow-2xl w-80 max-w-full">
-            <h3 className="font-bold text-slate-800 text-sm mb-4">Other Element</h3>
+            <h3 className="font-bold text-slate-800 text-sm mb-4">{t('otherElementTitle')}</h3>
             <input 
               autoFocus
               type="text" 
@@ -2192,8 +2866,8 @@ export default function App() {
               className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-4"
               placeholder="e.g. Fe, Na, Ag"
             />
-            <div className="flex justify-end gap-2 text-xs font-bold font-sans">
-              <button onClick={() => {setShowElementPrompt(false); setCustomElement("")}} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded">CANCEL</button>
+            <div className="flex justify-end gap-2 text-sm font-bold font-sans">
+              <button onClick={() => {setShowElementPrompt(false); setCustomElement("")}} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded">{t('cancelBtn')}</button>
               <button 
                 onClick={() => {
                   if (customElement) {
@@ -2204,7 +2878,7 @@ export default function App() {
                   }
                 }} 
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded"
-              >SELECT</button>
+              >{t('selectBtn')}</button>
             </div>
           </div>
         </div>
@@ -2228,12 +2902,12 @@ function ToolPaletteButton({
   variant?: 'primary' | 'danger'
 }) {
   return (
-    <div className="flex flex-col items-center space-y-1">
+    <div className="flex flex-col items-center space-y-1 w-full max-w-[54px]">
       <button
         onPointerDown={onClick}
         title={label}
         className={cn(
-          "w-12 h-12 flex items-center justify-center rounded-xl border transition-all relative overflow-hidden group touch-action-none",
+          "w-11 h-11 flex items-center justify-center rounded-xl border transition-all relative overflow-hidden group touch-action-none",
           active 
             ? variant === 'danger' 
               ? "border-red-200 bg-red-100 text-red-600 shadow-sm"
@@ -2246,7 +2920,7 @@ function ToolPaletteButton({
         </div>
         {active && <motion.div layoutId="tool-highlight" className={cn("absolute inset-x-0 bottom-0 h-0.5", variant === 'danger' ? 'bg-red-500' : 'bg-indigo-500')} />}
       </button>
-      <p className={cn("text-[8px] font-black uppercase tracking-tighter transition-colors", active ? variant === 'danger' ? 'text-red-600' : 'text-indigo-700' : 'text-slate-400')}>
+      <p className={cn("text-xs whitespace-nowrap overflow-hidden w-full text-center font-bold tracking-tight transition-colors", active ? variant === 'danger' ? 'text-red-600' : 'text-indigo-700' : 'text-slate-400', label === 'e⁻' ? 'normal-case' : 'uppercase')}>
         {label === 'Lone Pr' ? 'L-Pairs' : label}
       </p>
     </div>
@@ -2256,7 +2930,6 @@ function ToolPaletteButton({
 function AtomRenderer({ 
   atom, 
   onPointerDown, 
-  onPointerUp,
   isEraser,
   isSelected,
   currentValency,
@@ -2266,11 +2939,11 @@ function AtomRenderer({
   hideCHydrogens,
   skeletalMode,
   hideImplicitHydrogens,
-  filledMode = true
+  filledMode = true,
+  showValencyWarnings = true
 }: { 
   atom: Atom, 
   onPointerDown: (e: React.PointerEvent) => void,
-  onPointerUp: (e: React.PointerEvent) => void,
   isEraser: boolean,
   isSelected: boolean,
   currentValency: number,
@@ -2281,11 +2954,12 @@ function AtomRenderer({
   skeletalMode?: boolean,
   hideImplicitHydrogens?: boolean,
   filledMode?: boolean,
+  showValencyWarnings?: boolean,
   key?: string
 }) {
   const color = ATOM_COLORS[atom.symbol] || '#e2e8f0'; // slate-200 callback
   const baseTextColor = ATOM_TEXT_COLORS[atom.symbol] || '#475569'; // slate-600 callback
-  const isOverValency = currentValency > expectedValency;
+  const isOverValency = showValencyWarnings && currentValency > expectedValency;
   const implicitH = Math.max(0, expectedValency - currentValency);
   
   const isSkeletalC = skeletalMode && atom.symbol === 'C';
@@ -2323,7 +2997,13 @@ function AtomRenderer({
     let availableAngles: number[] = [...hBondAngles];
 
     if (covBondAngles.length === 0) {
-      availableAngles.push(...[-Math.PI/2, 0, Math.PI/2, Math.PI]);
+      if (atom.lonePairs === 1) {
+        availableAngles.push(-Math.PI/2);
+      } else if (atom.lonePairs === 2) {
+        availableAngles.push(-Math.PI * 3/4, -Math.PI / 4);
+      } else {
+        availableAngles.push(...[-Math.PI/2, 0, Math.PI/2, Math.PI]);
+      }
     } else if (covBondAngles.length === 1) {
       const a = covBondAngles[0];
       availableAngles.push(...[a + Math.PI, a + Math.PI/2, a - Math.PI/2, a + Math.PI * 3/4]);
@@ -2358,11 +3038,11 @@ function AtomRenderer({
     };
     const baseR = getBaseR();
     const radius = baseR + 2;
-    const dotSize = 1.5;
-    const pairSpread = 5.0;
+    const dotSize = 2.0;
+    const pairSpread = 8.0;
 
     for (let i = 0; i < atom.lonePairs; i++) {
-      const angle = availableAngles[i % availableAngles.length] || 0;
+      let angle = availableAngles[i % availableAngles.length] || 0;
       
       const px = Math.cos(angle + Math.PI/2) * pairSpread / 2;
       const py = Math.sin(angle + Math.PI/2) * pairSpread / 2;
@@ -2384,7 +3064,6 @@ function AtomRenderer({
     <g 
       className="select-none cursor-pointer group"
       onPointerDown={onPointerDown}
-      onPointerUp={onPointerUp}
     >
       <circle
         cx={atom.x}
@@ -2409,7 +3088,7 @@ function AtomRenderer({
           dy="0.32em"
           textAnchor="middle"
           fill={textColor}
-          className="font-black text-base pointer-events-none tracking-tighter"
+          className="font-black text-lg pointer-events-none tracking-tighter"
           style={{ fontFamily: 'var(--font-sans)', letterSpacing: '-0.05em' }}
         >
           {atom.symbol}
@@ -2422,7 +3101,7 @@ function AtomRenderer({
           x={atom.x + ((ATOM_RADII[atom.symbol] || 20) * 0.7)}
           y={atom.y + ((ATOM_RADII[atom.symbol] || 20) * 0.7)}
           fill={shouldDrawFill ? (color === '#ffffff' ? '#64748b' : color) : textColor}
-          className="font-bold text-[10px] pointer-events-none"
+          className="font-bold text-sm pointer-events-none"
           style={{ filter: shouldDrawFill ? 'drop-shadow(0 1px 2px rgba(0,0,0,0.2))' : 'none' }}
         >
           H{implicitH > 1 ? implicitH : ''}
@@ -2509,6 +3188,22 @@ function BondRenderer({
             <line x1={0} y1={spacing} x2={bondLength} y2={spacing} stroke={isSelected ? activeColor : color} strokeWidth={strokeWidth} strokeLinecap="round" />
           </>
         );
+      case 4:
+        return (
+          <polygon points={`0,0 ${bondLength},${-spacing*1.2} ${bondLength},${spacing*1.2}`} fill={isSelected ? activeColor : color} />
+        );
+      case 5: {
+        const dashes = [];
+        const numDashes = 7;
+        for (let i = 1; i <= numDashes; i++) {
+          const x = (bondLength / numDashes) * i;
+          const h = (spacing * 1.5) * (i / numDashes);
+          dashes.push(
+            <line key={i} x1={x} y1={-h} x2={x} y2={h} stroke={isSelected ? activeColor : color} strokeWidth={2} strokeLinecap="round" />
+          );
+        }
+        return <>{dashes}</>;
+      }
     }
   };
 
@@ -2519,7 +3214,7 @@ function BondRenderer({
       className="cursor-pointer group"
     >
       <line x1={0} y1={0} x2={bondLength} y2={0} className="stroke-transparent stroke-[16px]" />
-      <g className={cn("transition-all", isEraser ? "group-hover:[&>line]:stroke-red-500 group-hover:[&>line]:stroke-opacity-100" : isSelected ? "" : "group-hover:[&>line]:stroke-indigo-300 group-hover:opacity-100 opacity-90")}>
+      <g className={cn("transition-all", isEraser ? "group-hover:[&>line]:stroke-red-500 group-hover:[&>polygon]:fill-red-500" : isSelected ? "" : "group-hover:[&>line]:stroke-indigo-300 group-hover:[&>polygon]:fill-indigo-300 opacity-90 group-hover:opacity-100")}>
         {renderLines()}
       </g>
     </g>

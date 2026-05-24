@@ -2,10 +2,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
     <title>ChemConnect Studio</title>
+    <style>
+      body, html {
+        overscroll-behavior: none;
+        touch-action: none;
+      }
+    </style>
   </head>
   <body>
+    <div id="stack-design-param" style="display:none;">{#design#}</div>
+    <div id="stack-ta-param" style="display:none;">{#ta#}</div>
+    <div id="stack-lang-param" style="display:none;">{#lang#}</div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
     <script>
