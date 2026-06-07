@@ -1,0 +1,6 @@
+{
+  "Fault": {
+    "Code": "PUGREST.ServerBusy",
+    "Message": "Too many requests or server too busy"
+  }
+}

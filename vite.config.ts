@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 import { viteSingleFile } from "vite-plugin-singlefile";
+import { visualizer } from "rollup-plugin-visualizer";
 import { execSync } from 'child_process';
 import fs from 'fs';
 
@@ -36,7 +37,7 @@ function buildOnDemandPlugin() {
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
   return {
-    plugins: [react(), tailwindcss(), viteSingleFile(), buildOnDemandPlugin()],
+    plugins: [react(), tailwindcss(), viteSingleFile(), buildOnDemandPlugin(), visualizer({ open: false, filename: 'stats.html' })],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
     },

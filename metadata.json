@@ -1,7 +1,10 @@
 {
   "name": "Molecule Master",
   "description": "A professional molecular drawing tool designed for chemistry education and LMS integration.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": [
+    "clipboard-read",
+    "clipboard-write"
+  ],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]
